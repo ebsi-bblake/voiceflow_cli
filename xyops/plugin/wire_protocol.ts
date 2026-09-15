@@ -1,0 +1,71 @@
+import { PLUGIN_VERSION } from "./version";
+import { PluginValidationFault } from "./validation_fault";
+import type { XYOpsPluginResponse, VoiceflowEnvelope } from "./types";
+
+type MapVoiceflowEnvelope = (
+  envelope: VoiceflowEnvelope,
+) => XYOpsPluginResponse;
+export const mapVoiceflowEnvelope: MapVoiceflowEnvelope = (envelope) => {
+  if (envelope.ok) {
+    return {
+      xy: 1,
+      data: { voiceflow: envelope },
+      complete: true,
+      code: 0,
+    };
+  }
+  return {
+    xy: 1,
+    data: { voiceflow: envelope },
+    complete: true,
+    code: envelope.error.code,
+    description: `[pluginVersion=${PLUGIN_VERSION}] ${envelope.error.message} (code=${envelope.error.code})`,
+  };
+};
+
+type CreateProtocolFailure = (
+  code: string,
+  description: string,
+  envelope?: VoiceflowEnvelope,
+) => XYOpsPluginResponse;
+export const createProtocolFailure: CreateProtocolFailure = (
+  code,
+  description,
+  envelope,
+) => ({
+  xy: 1,
+  ...(envelope === undefined ? {} : { data: { voiceflow: envelope } }),
+  complete: true,
+  code,
+  description,
+});
+
+type AppendPluginDiagnostic = (
+  description: string,
+  diagnostic?: string,
+) => string;
+const appendPluginDiagnostic: AppendPluginDiagnostic = (
+  description,
+  diagnostic,
+) =>
+  diagnostic === undefined ? description : `${description} [${diagnostic}]`;
+
+type MapPluginError = (
+  error: unknown,
+  diagnostic?: string,
+) => XYOpsPluginResponse;
+export const mapPluginError: MapPluginError = (error, diagnostic) => {
+  if (error instanceof PluginValidationFault) {
+    return createProtocolFailure(
+      error.code,
+      appendPluginDiagnostic(error.message, diagnostic),
+    );
+  }
+  return createProtocolFailure(
+    "PLUGIN_FAILURE",
+    appendPluginDiagnostic(
+      "The Voiceflow plugin could not complete the request.",
+      diagnostic,
+    ),
+  );
+};

@@ -155,13 +155,27 @@ test.each(["output", "data"] as const)("fetches the final job once and parses it
   expect(paths).toEqual(["/api/app/run_event/v1", "/api/app/get_job/v1"]);
 });
 
-test("does not redispatch after a stream failure", async () => {
+test("reconciles the final job after a stream failure without redispatching", async () => {
   let dispatches = 0;
   const client = createXYOpsClient({
     baseURL: "https://xyops.example.test", apiKey: "stream-api-key", events: {} as never,
     httpTimeoutMs: 1_000, pollIntervalMs: 1, pollTimeoutMs: 1_000, streamMaxBytes: 1_000, streamMaxFrameBytes: 1_000,
   }, {
-    fetcher: async () => { dispatches += 1; return new Response(JSON.stringify({ code: 0, id: "job-1" }), { status: 200 }); },
+    fetcher: async () => {
+      dispatches += 1;
+      return dispatches === 1
+        ? new Response(JSON.stringify({ code: 0, id: "job-1" }), { status: 200 })
+        : new Response(JSON.stringify({
+            code: 0,
+            job: {
+              id: "job-1",
+              code: 0,
+              completed: true,
+              output: JSON.stringify(successfulEnvelope()),
+              data: null,
+            },
+          }), { status: 200 });
+    },
     streamer: async () => { throw new Error("disconnect"); },
   });
 
@@ -169,6 +183,6 @@ test("does not redispatch after a stream failure", async () => {
     "execute-event",
     { operation: "execute_migration" },
     isVoiceflowEnvelope(() => true),
-  )).rejects.toMatchObject({ diagnostic: { code: "execute-outcome-unknown" } });
-  expect(dispatches).toBe(1);
+  )).resolves.toEqual(successfulEnvelope());
+  expect(dispatches).toBe(2);
 });

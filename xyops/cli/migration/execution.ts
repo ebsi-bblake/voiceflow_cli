@@ -10,7 +10,6 @@ import type {
   VoiceflowWarning,
 } from "../types";
 import { executeParameters } from "../state";
-import { fail } from "../diagnostics";
 import type { MigrationContext } from "./selection";
 
 type DisplayPlan = (plan: MigrationPlan) => void;
@@ -59,7 +58,7 @@ type ExecuteConfirmedMigration = (
   selection: MigrationSelection,
   planID: string,
   secretFileContents?: SecretEntries,
-) => Promise<void>;
+) => Promise<ExecuteResult>;
 export const executeConfirmedMigration: ExecuteConfirmedMigration = async (
   { client, config },
   selection,
@@ -76,8 +75,8 @@ export const executeConfirmedMigration: ExecuteConfirmedMigration = async (
     "execute_migration",
     isExecuteResult,
   );
-  console.log(JSON.stringify(summarizeExecution(execute, planID)));
   warnAPIKeyRetrieval(executeResponse);
+  return execute;
 };
 
 type ConfirmAndExecuteMigration = (
@@ -94,26 +93,4 @@ export const confirmAndExecuteMigration: ConfirmAndExecuteMigration = async (
 ) => {
   if (await requestMigrationConfirmation(context.reader))
     await executeConfirmedMigration(context, selection, planID, secretFileContents);
-};
-
-const executionFieldKeys = [
-  "exportStatus",
-  "exportBytes",
-  "importStatus",
-  "importBytes",
-] as const;
-const summarizeExecution = (
-  value: unknown,
-  planID: string,
-): Readonly<Record<string, unknown>> => {
-  if (!isExecuteResult(value))
-    throw fail("envelope", {
-      nextAction: "The execute event returned an invalid result.",
-    });
-  return {
-    migrationCompleted: true,
-    planID,
-    ...Object.fromEntries(executionFieldKeys.map((key) => [key, value[key]])),
-    apiKeyRetrieved: value.apiKeyRetrieved,
-  };
 };

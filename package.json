@@ -1,6 +1,6 @@
 {
   "name": "voiceflow-automation",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "pluginVersion": "0.0.18",
   "devDependencies": {
     "@cucumber/cucumber": "^13.2.1",
@@ -16,6 +16,11 @@
     "typecheck": "tsc --noEmit",
     "build:plugin": "PLUGIN_VERSION=$(bun -e \"console.log(require('./package.json').pluginVersion)\") && bun build xyops/plugin/entrypoint.ts --target=node --format=cjs --banner=\"// Voiceflow XYOps Event Plugin v$PLUGIN_VERSION\" --outfile=dist/voiceflow-event-plugin.cjs",
     "build:cli": "bun scripts/build-cli.ts",
+    "build:cli:darwin-arm64": "bun scripts/build-cli.ts darwin-arm64",
+    "build:cli:darwin-x64": "bun scripts/build-cli.ts darwin-x64",
+    "build:cli:linux-arm64": "bun scripts/build-cli.ts linux-arm64",
+    "build:cli:linux-x64": "bun scripts/build-cli.ts linux-x64",
+    "build:cli:windows-x64": "bun scripts/build-cli.ts windows-x64",
     "bdd": "bun scripts/bdd-runners.ts",
     "verify:cli": "bun scripts/validate-cli-artifacts.ts",
     "check": "bun run lint && bun run typecheck && bun run test"

@@ -2,302 +2,213 @@ import type { AuthContext, SecretEntry } from "../types";
 import { OperationFault } from "../contracts";
 import { VoiceflowRegex } from "../regex";
 import { createUUID } from "../uuid";
-import { VOICEFLOW_REALTIME_WEBSOCKET_URL } from "../urls";
 import { debugLog } from "../debug";
 import {
+  startLoguxConnection,
+  type LoguxConnection,
+  type LoguxFrame,
+} from "./connection";
+import {
   createSecretState,
-  transitionSecretState,
+  transitionSecretStateWithEffects,
+  type SecretEffect,
   type SecretEvent,
   type SecretState,
-} from "./state-machine";
+} from "./secret-state-machine";
+import {
+  isSecretCompletion,
+  isSecretFailure,
+  summarizeLoguxAction,
+  summarizeSecretFailureFrame,
+  type TraceFields,
+} from "./frame-contract";
 
+type CreateSecretDependencies = Readonly<{
+  readonly webSocket?: typeof WebSocket;
+}>;
 type CreateSecret = (
   auth: AuthContext,
   assistantID: string,
   secret: SecretEntry,
+  dependencies?: CreateSecretDependencies,
 ) => Promise<void>;
 
-type TraceFields = Readonly<Record<string, unknown>>;
 const trace = (event: string, fields: TraceFields = {}): void =>
   debugLog("logux-secret", event, fields);
-
-const actionSummary = (frame: Frame): TraceFields => {
-  const action = frame[2];
-  if (!isRecord(action)) return {};
-  const meta = isRecord(action.meta) ? action.meta : {};
-  return {
-    actionType: typeof action.type === "string" ? action.type : undefined,
-    actionID: typeof meta.actionID === "string" ? meta.actionID : undefined,
-    processedID: typeof action.id === "string" ? action.id : undefined,
-  };
-};
-
-const traceFrame = (direction: "in" | "out", frame: Frame): void =>
+const traceFrame = (direction: "in" | "out", frame: LoguxFrame): void =>
   trace(`${direction} frame`, {
     frameType: frame[0],
     syncID: frame[1],
-    ...actionSummary(frame),
+    ...summarizeLoguxAction(frame),
     ...summarizeSecretFailureFrame(frame),
   });
+const randomActionNumber = (): number =>
+  Math.floor(Math.random() * 1_000_000_000) + 1;
 
-export const createSecret: CreateSecret = (auth, assistantID, secret) =>
+/* oxlint-disable complexity -- protocol lifecycle branches are explicit. */
+export const createSecret: CreateSecret = (
+  auth,
+  assistantID,
+  secret,
+  dependencies = {},
+) =>
   new Promise((resolve, reject) => {
-    const ws = new WebSocket(VOICEFLOW_REALTIME_WEBSOCKET_URL);
     const clientID = createUUID()
       .replace(VoiceflowRegex.base64UrlDash, "")
       .slice(0, 8);
     const origin = `${auth.creatorID}:${clientID}:${createUUID().replace(VoiceflowRegex.base64UrlDash, "").slice(0, 8)}`;
     const actionID = createUUID();
-    const subscriptionID = Math.floor(Math.random() * 1_000_000_000) + 1;
+    const subscriptionID = randomActionNumber();
     const mutationSyncID = subscriptionID + 1;
     let actionTime = 1;
     let state: SecretState = createSecretState(assistantID, actionID);
-    let settled = false;
-    const dispatch = (event: SecretEvent): void => {
-      state = transitionSecretState(state, event);
-    };
+    let connection: LoguxConnection | undefined;
+
     const settle = (error?: OperationFault): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        ws.close();
-      } catch {
-        /* settlement must not be interrupted */
-      }
-      /* oxlint-disable complexity, no-unused-expressions */
-      error ? reject(error) : resolve();
-    };
-    const timer = setTimeout(
-      () => {
-        dispatch({ kind: "timeout" });
-        settle(
-          new OperationFault(
-            "DEPENDENCY_TIMEOUT",
-            true,
-            `logux-${state.kind.toLowerCase()}-timeout`,
-          ),
-        );
-      },
-      15_000,
-    );
-    ws.onerror = () => {
-      dispatch({ kind: "socket-error" });
-      settle(
+      connection?.cleanup();
+      if (error !== undefined) return reject(error);
+      if (state.kind === "COMPLETED") return resolve();
+      const code =
+        state.kind === "UNKNOWN_OUTCOME" && state.code === "DEPENDENCY_TIMEOUT"
+          ? "DEPENDENCY_TIMEOUT"
+          : "DEPENDENCY_FAILURE";
+      reject(
         new OperationFault(
-          "DEPENDENCY_FAILURE",
+          code,
           true,
-          `logux-${state.kind.toLowerCase()}-error`,
+          `logux-${state.kind.toLowerCase()}-terminal`,
         ),
       );
     };
-    ws.onclose = () => {
-      if (!settled) {
-        dispatch({ kind: "socket-close" });
-        settle(
-          new OperationFault(
-            "DEPENDENCY_FAILURE",
-            true,
-            `logux-${state.kind.toLowerCase()}-close`,
-          ),
-        );
-      }
+    const dispatch = (event: SecretEvent): void => {
+      const transition = transitionSecretStateWithEffects(state, event);
+      state = transition.state;
+      executeEffects(transition.effects);
     };
-    ws.onopen = () => {
-      dispatch({ kind: "socket-open" });
-      const frame: Frame = [
-        "connect",
-        4,
-        origin,
-        0,
-        { token: "[redacted]", subprotocol: "1.9.0" },
-      ];
+    const send = (frame: LoguxFrame): void => {
       traceFrame("out", frame);
-      ws.send(
-        JSON.stringify([
-          "connect",
-          4,
-          origin,
-          0,
-          { token: auth.token, subprotocol: "1.9.0" },
-        ]),
-      );
+      connection?.send(frame);
     };
-    ws.onmessage = (event) => {
-      if (typeof event.data !== "string") return;
-      const frame = parseFrame(event.data);
-      if (!frame) return;
-      traceFrame("in", frame);
-      if (frame[0] === "error") {
-        const lifecycle = state.kind.toLowerCase();
-        dispatch({ kind: "error-frame" });
-        return settle(
-          new OperationFault(
-            "DEPENDENCY_FAILURE",
-            true,
-            `logux-${lifecycle}-error-frame`,
-          ),
-        );
-      }
-      if (frame[0] === "connected") {
-        dispatch({ kind: "connected" });
+    const executeEffects = (effects: readonly SecretEffect[]): void => {
+      for (const effect of effects) {
         try {
-          sendSubscription(ws, assistantID, subscriptionID, actionTime++);
+          if (effect.kind === "send-mutation")
+            send([
+              "sync",
+              effect.mutationSyncID,
+              {
+                type: "secret.CREATE_ONE_STARTED",
+                payload: {
+                  context: { assistantID },
+                  data: {
+                    name: secret.name,
+                    visibility: "masked",
+                    defaultValue: secret.value,
+                  },
+                },
+                meta: { origin, actionID },
+              },
+              { id: randomActionNumber(), time: actionTime++ },
+            ]);
+          if (effect.kind === "close-socket") connection?.cleanup();
+          if (effect.kind === "settle") settle();
         } catch {
-          dispatch({ kind: "socket-error" });
-          settle(new OperationFault("DEPENDENCY_FAILURE", true));
-        }
-        return;
-      }
-      if (isSubscriptionComplete(frame, subscriptionID)) {
-        dispatch({ kind: "subscription-synced" });
-        try {
-          sendCreateAction(
-            ws,
-            assistantID,
-            secret,
-            origin,
-            actionID,
-            mutationSyncID,
-            actionTime++,
+          dispatch({ kind: "transport-failure" });
+          settle(
+            new OperationFault(
+              "DEPENDENCY_FAILURE",
+              true,
+              `logux-${state.kind.toLowerCase()}-error`,
+            ),
           );
-          dispatch({ kind: "mutation-sent", mutationSyncID });
-        } catch {
-          dispatch({ kind: "socket-error" });
-          settle(new OperationFault("DEPENDENCY_FAILURE", true));
         }
-        return;
-      }
-      if (isFailedFrame(frame, actionID)) {
-        const lifecycle = state.kind.toLowerCase();
-        dispatch({ kind: "error-frame" });
-        return settle(
-          new OperationFault(
-            "DEPENDENCY_FAILURE",
-            true,
-            `logux-${lifecycle}-failed`,
-          ),
-        );
-      }
-      if (isDoneFrame(frame, actionID, assistantID)) {
-        dispatch({ kind: "secret-done", actionID });
-        settle();
       }
     };
-  });
 
-const sendSubscription = (
-  ws: WebSocket,
-  assistantID: string,
-  subscriptionID: number,
-  time: number,
-): void => {
-  const frame: Frame = [
-    "sync",
-    subscriptionID,
-    {
-      channel: `assistant/${assistantID}`,
-      type: "logux/subscribe",
-      since: { id: "0", time: 0 },
-    },
-    { id: randomActionNumber(), time },
-  ];
-  traceFrame("out", frame);
-  ws.send(JSON.stringify(frame));
-};
-const isSubscriptionComplete = (
-  frame: Frame,
-  subscriptionID: number,
-): boolean => frame[0] === "synced" && frame[1] === subscriptionID;
-
-const sendCreateAction = (
-  ws: WebSocket,
-  assistantID: string,
-  secret: SecretEntry,
-  origin: string,
-  actionID: string,
-  mutationSyncID: number,
-  time: number,
-): void => {
-  const frame: Frame = [
-    "sync",
-    mutationSyncID,
-    {
-      type: "secret.CREATE_ONE_STARTED",
-      payload: {
-        context: { assistantID },
-        data: {
-          name: secret.name,
-          visibility: "masked",
-          defaultValue: secret.value,
-        },
+    connection = startLoguxConnection({
+      token: auth.token,
+      origin,
+      webSocket: dependencies.webSocket,
+      subscription: {
+        frame: [
+          "sync",
+          subscriptionID,
+          {
+            channel: `assistant/${assistantID}`,
+            type: "logux/subscribe",
+            since: { id: "0", time: 0 },
+          },
+          { id: randomActionNumber(), time: actionTime++ },
+        ],
       },
-      meta: { origin, actionID },
-    },
-    { id: randomActionNumber(), time },
-  ];
-  traceFrame("out", frame);
-  ws.send(JSON.stringify(frame));
-};
-const randomActionNumber = (): number =>
-  Math.floor(Math.random() * 1_000_000_000) + 1;
-
-type Frame = readonly unknown[];
-const parseFrame = (text: string): Frame | undefined => {
-  try {
-    const value: unknown = JSON.parse(text);
-    return Array.isArray(value) ? value : undefined;
-  } catch {
-    return undefined;
-  }
-};
-type SummarizeSecretFailureFrame = (frame: Frame) => TraceFields;
-export const summarizeSecretFailureFrame: SummarizeSecretFailureFrame = (frame) => {
-  const action = frame[2];
-  if (!isRecord(action) || action.type !== "secret.CREATE_ONE_FAILED") return {};
-  const payload = isRecord(action.payload) ? action.payload : undefined;
-  const error = payload && isRecord(payload.error) ? payload.error : undefined;
-  return {
-    failureCode: safeFailureText(error?.code),
-    failureMessage: safeFailureText(error?.message),
-    failureDetails: error === undefined ? "missing" : "opaque",
-  };
-};
-const safeFailureText = (value: unknown): string | undefined => {
-  if (typeof value !== "string") return undefined;
-  const sanitized = value
-    .replace(VoiceflowRegex.redactedBearer, "Bearer [redacted]")
-    .replace(VoiceflowRegex.voiceflowAPIKey, "VF.DM.[redacted]")
-    .replace(VoiceflowRegex.redactedURL, "[redacted-url]")
-    .replace(VoiceflowRegex.longSecretToken, "[redacted-token]")
-    .replace(VoiceflowRegex.controlCharacter, " ")
-    .replace(VoiceflowRegex.whitespace, " ")
-    .trim();
-  return sanitized.length <= 480
-    ? sanitized
-    : `${sanitized.slice(0, 240)} … ${sanitized.slice(-240)}`;
-};
-const isFailedFrame = (frame: Frame, actionID: string): boolean => {
-  const action = frame[2];
-  if (!isRecord(action) || action.type !== "secret.CREATE_ONE_FAILED")
-    return false;
-  const meta = action.meta;
-  return isRecord(meta) && meta.actionID === actionID;
-};
-const isDoneFrame = (
-  frame: Frame,
-  actionID: string,
-  assistantID: string,
-): boolean => {
-  const action = frame[2];
-  if (!isRecord(action) || action.type !== "secret.CREATE_ONE_DONE")
-    return false;
-  const meta = action.meta;
-  if (!isRecord(meta) || meta.actionID !== actionID) return false;
-  const payload = isRecord(action.payload) ? action.payload : undefined;
-  const result = payload && isRecord(payload.result) ? payload.result : undefined;
-  const context = result && isRecord(result.context) ? result.context : undefined;
-  return context?.assistantID === assistantID;
-};
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  value !== null && typeof value === "object" && !Array.isArray(value);
+      onEvent: (event) => {
+        if (event.kind === "connection-opened")
+          return dispatch({ kind: "connection-established" });
+        if (
+          event.kind === "connection-interrupted" &&
+          event.reason === "timeout"
+        ) {
+          dispatch({ kind: "transport-timeout" });
+          return settle(
+            new OperationFault(
+              "DEPENDENCY_TIMEOUT",
+              true,
+              `logux-${state.kind.toLowerCase()}-timeout`,
+            ),
+          );
+        }
+        if (event.kind === "connection-interrupted") {
+          dispatch({ kind: "connection-interrupted" });
+          return settle(
+            new OperationFault(
+              "DEPENDENCY_FAILURE",
+              true,
+              `logux-${state.kind.toLowerCase()}-close`,
+            ),
+          );
+        }
+        if (event.kind === "transport-failure") {
+          dispatch({ kind: "transport-failure" });
+          return settle(
+            new OperationFault(
+              "DEPENDENCY_FAILURE",
+              true,
+              `logux-${state.kind.toLowerCase()}-${event.diagnostic}`,
+            ),
+          );
+        }
+        const frame = event.frame;
+        traceFrame("in", frame);
+        if (frame[0] === "error") {
+          dispatch({ kind: "error-frame" });
+          return settle(
+            new OperationFault(
+              "DEPENDENCY_FAILURE",
+              true,
+              `logux-${state.kind.toLowerCase()}-error-frame`,
+            ),
+          );
+        }
+        if (frame[0] === "connected") return dispatch({ kind: "connected" });
+        if (frame[0] === "synced" && frame[1] === subscriptionID) {
+          dispatch({ kind: "subscription-synced" });
+          dispatch({ kind: "mutation-sent", mutationSyncID });
+          return;
+        }
+        if (isSecretFailure(frame, actionID)) {
+          dispatch({ kind: "error-frame" });
+          return settle(
+            new OperationFault(
+              "DEPENDENCY_FAILURE",
+              true,
+              `logux-${state.kind.toLowerCase()}-failed`,
+            ),
+          );
+        }
+        if (isSecretCompletion(frame, actionID, assistantID)) {
+          dispatch({ kind: "secret-done", actionID });
+          return settle();
+        }
+      },
+    });
+  });

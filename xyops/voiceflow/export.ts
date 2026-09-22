@@ -6,18 +6,19 @@ import { parseSchemaVersion, parseVersionID } from "./validation";
 import { VoiceflowRegex } from "./regex";
 import { VOICEFLOW_REALTIME_HTTP_ORIGIN, encodePathSegment } from "./urls";
 import type { ExportArtifact } from "./types";
+import { ExportPayloadSchema } from "./schemas/export_payload";
+import { isRecord } from "./guards";
 export type { ExportArtifact } from "./types";
 const EXPORT_URL = `${VOICEFLOW_REALTIME_HTTP_ORIGIN}/v1alpha1/assistant/export-json`;
 type RecordValue = Readonly<Record<string, unknown>>;
-const isRecord = (value: unknown): value is RecordValue =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
 
-const exportedSchemaMetadata = (value: RecordValue): unknown => {
-  if (value._version !== undefined) return value._version;
-  if (isRecord(value.version) && value.version._version !== undefined)
-    return value.version._version;
-  if (isRecord(value.project) && value.project._version !== undefined)
-    return value.project._version;
+const exportedSchemaMetadata = (value: RecordValue): unknown =>
+  isRecord(value.version) ? value.version._version : undefined;
+
+type NormalizeSchemaVersion = (value: unknown) => string | undefined;
+const normalizeSchemaVersion: NormalizeSchemaVersion = (value) => {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
   return undefined;
 };
 
@@ -36,19 +37,21 @@ export const readExportedSchemaVersion: ReadExportedSchemaVersion = (
       "exported artifact must contain JSON version metadata with _version in the form major.minor",
     );
   }
-  const rawVersion = isRecord(payload)
-    ? exportedSchemaMetadata(payload)
+  const parsed = ExportPayloadSchema.safeParse(payload);
+  const rawVersion = parsed.success
+    ? exportedSchemaMetadata(parsed.data)
     : undefined;
+  const normalizedVersion = normalizeSchemaVersion(rawVersion);
   if (
-    typeof rawVersion !== "string" ||
-    !VoiceflowRegex.schemaVersion.test(rawVersion.trim())
+    normalizedVersion === undefined ||
+    !VoiceflowRegex.schemaVersion.test(normalizedVersion)
   )
     throw new OperationFault(
       "CONFIGURATION",
       false,
       "exported artifact must contain JSON version metadata with _version in the form major.minor",
     );
-  return parseSchemaVersion(rawVersion);
+  return parseSchemaVersion(normalizedVersion);
 };
 
 type ResolveTargetSchemaVersion = (

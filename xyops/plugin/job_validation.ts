@@ -1,65 +1,65 @@
 import { PluginValidationFault } from "./validation_fault";
-import { isNonEmptyString, isPluginOperation, isRecord } from "./guards";
+import { z } from "zod";
+import { MigrationParameterName } from "../migration-parameters";
+import {
+  NativePluginJobSchema,
+  PluginOperationSchema,
+  type ParsedNativePluginJob,
+} from "./schemas/native_plugin_job";
 import type {
   NativePluginJob,
   PluginOperation,
   PluginParameters,
 } from "./types";
-export { isPluginOperation } from "./guards";
-
 const requireOperationName = (value: unknown): string => {
-  if (!isNonEmptyString(value))
+  const parsed = z.string().trim().min(1).safeParse(value);
+  if (!parsed.success)
     throw new PluginValidationFault(
       "INVALID_INPUT",
       "An operation parameter is required.",
     );
-  return value;
+  return parsed.data;
 };
 
 const requireSupportedOperation = (value: string): PluginOperation => {
-  if (!isPluginOperation(value))
+  const parsed = PluginOperationSchema.safeParse(value);
+  if (!parsed.success)
     throw new PluginValidationFault(
       "UNKNOWN_OPERATION",
       "The requested operation is not supported.",
     );
-  return value;
+  return parsed.data;
 };
 
 type SelectOperation = (params: PluginParameters) => PluginOperation;
 const selectOperation: SelectOperation = (params) =>
-  requireSupportedOperation(requireOperationName(params.operation));
+  requireSupportedOperation(
+    requireOperationName(params[MigrationParameterName.operation]),
+  );
 
-const isPluginEventJob = (
-  value: unknown,
-): value is { readonly params: PluginParameters } => {
-  if (!isRecord(value)) return false;
-  return isEventRecord(value);
-};
-
-const isEventRecord = (
-  value: Record<string, unknown>,
-): value is { readonly params: PluginParameters } => {
-  if (value.xy !== 1) return false;
-  return isEventTypeRecord(value);
-};
-
-const isEventTypeRecord = (
-  value: Record<string, unknown>,
-): value is { readonly params: PluginParameters } => {
-  if (value.type !== "event") return false;
-  return isRecord(value.params);
-};
-
-type ValidatePluginJob = (value: unknown) => NativePluginJob;
-export const validatePluginJob: ValidatePluginJob = (value) => {
-  if (!isPluginEventJob(value))
+type ParseNativePluginJob = (value: unknown) => ParsedNativePluginJob;
+const parseNativePluginJob: ParseNativePluginJob = (value) => {
+  const parsed = NativePluginJobSchema.safeParse(value);
+  if (!parsed.success)
     throw new PluginValidationFault(
       "INVALID_INPUT",
       "The plugin input must be an XYOps event job with object-valued params.",
     );
-  const params = value.params;
+  return parsed.data;
+};
+
+type ValidatePluginJob = (value: unknown) => NativePluginJob;
+export const validatePluginJob: ValidatePluginJob = (value) => {
+  const parsed = parseNativePluginJob(value);
+  const params: PluginParameters = parsed.params;
   const operation = selectOperation(params);
-  return { params, operation };
+  return {
+    params,
+    operation,
+    input: parsed.input,
+    workflowData: parsed.workflowData,
+    workflow: parsed.workflow,
+  };
 };
 
 type ParsePluginJob = (input: string) => NativePluginJob;
@@ -81,7 +81,8 @@ type ReadVoiceflowJWT = (
 ) => string;
 export const readVoiceflowJWT: ReadVoiceflowJWT = (environment) => {
   const environmentSecret = environment.VOICEFLOW_JWT;
-  if (isNonEmptyString(environmentSecret)) return environmentSecret;
+  const parsed = z.string().min(1).safeParse(environmentSecret);
+  if (parsed.success && parsed.data.trim() !== "") return parsed.data;
   throw new PluginValidationFault(
     "MISSING_SECRET",
     "The Voiceflow JWT secret is not configured.",

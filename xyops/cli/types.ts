@@ -1,3 +1,6 @@
+import type { Diagnostic } from "../diagnostics/types";
+import type { ZodType } from "zod";
+
 export type Option = Readonly<{ value: string; label: string }>;
 export type MigrationSelection = Readonly<{
   sourceWorkspaceID: string;
@@ -18,6 +21,31 @@ export type MigrationPlan = Readonly<{
     destinationFolder: string;
   }>;
 }>;
+export type WorkflowMigrationSelection = Readonly<{
+  sourceWorkspaceID: string;
+  sourceProjectID: string;
+  sourceVersionID: string;
+  destinationWorkspaceID: string;
+  destinationFolderID?: string;
+  targetSchemaVersion?: string;
+}>;
+export type DestinationFolderCreation = Readonly<{
+  workspaceID: string;
+  requestedPath: string;
+  action: "CREATE_DESTINATION_FOLDER";
+}>;
+export type WorkflowMigrationPlan = Readonly<{
+  planID: string;
+  selection: WorkflowMigrationSelection;
+  labels: Readonly<{
+    sourceWorkspace: string;
+    sourceProject: string;
+    sourceVersion: string;
+    destinationWorkspace: string;
+    destinationFolder: string;
+  }>;
+  destinationFolderCreation?: DestinationFolderCreation;
+}>;
 export type VoiceflowWarning = Readonly<{ code: string; message: string }>;
 export type VoiceflowSuccess<T> = Readonly<{
   ok: true;
@@ -30,10 +58,15 @@ export type VoiceflowFailure = Readonly<{
   ok: false;
   operation: string;
   operationID: string;
-  error: Readonly<{ code: string; message: string; retryable: boolean }>;
+  error: Readonly<{
+    code: string;
+    message: string;
+    retryable: boolean;
+    diagnostic?: Diagnostic;
+  }>;
 }>;
 export type VoiceflowEnvelope<T> = VoiceflowSuccess<T> | VoiceflowFailure;
-export type ResponseGuard<T> = (value: unknown) => value is T;
+export type ResponseSchema<T> = ZodType<T>;
 export type XYOpsResponse = Readonly<{
   code: number | string;
   description?: string;
@@ -77,14 +110,14 @@ export type XYOpsStreamResult =
       jobID: string;
       code: number | string;
       data: Record<string, unknown>;
-      requiresJobResponse: true;
+      requiresJobResponse: boolean;
     }>
   | Readonly<{
       kind: "failure";
       jobID: string;
       code: number | string;
       data: Record<string, unknown>;
-      requiresJobResponse: true;
+      requiresJobResponse: boolean;
     }>;
 // These are the states currently documented by XYOps; unknown server states remain strings and are ignored safely.
 export const XYOpsJobState = {
@@ -102,6 +135,11 @@ export type XYOpsJob = Readonly<{
   description?: string;
   output?: string | null;
   data?: unknown;
+  final?: boolean;
+  suspended?: boolean;
+  workflowData?: Record<string, unknown>;
+  input?: unknown;
+  workflow?: unknown;
 }>;
 export type XYOpsJobResponse = XYOpsResponse &
   Readonly<{ job: XYOpsJob & Readonly<{ id: string }> }>;
@@ -148,12 +186,22 @@ export type XYOpsEventConfig = Readonly<{
   executeMigration: XYOpsEventReference;
 }>;
 export type XYOpsEventReference =
+  string | Readonly<{ id: string }> | Readonly<{ title: string }>;
+export type JSONValue =
   | string
-  | Readonly<{ id: string }>
-  | Readonly<{ title: string }>;
+  | number
+  | boolean
+  | null
+  | readonly JSONValue[]
+  | { readonly [key: string]: JSONValue };
+export type XYOpsWorkflowInput = Readonly<Record<string, JSONValue>>;
+export type MigrationExecutionMode = "events" | "workflow";
 export type XYOpsConfig = Readonly<{
   baseURL: string;
   apiKey: string;
+  migrationMode: MigrationExecutionMode;
+  migrationWorkflow?: XYOpsEventReference;
+  executionWorkflow?: XYOpsEventReference;
   events: XYOpsEventConfig;
   httpTimeoutMs: number;
   pollIntervalMs: number;
@@ -190,16 +238,23 @@ export type CliDiagnostic = Readonly<{
   retryable: boolean;
   status?: number;
   nextAction: string;
+  diagnostic?: Diagnostic;
 }>;
 export type XYOpsClient = Readonly<{
   readEvent: <T>(
     eventReference: XYOpsEventReference,
     params: EventParameters,
-    envelopeGuard: ResponseGuard<VoiceflowEnvelope<T>>,
+    envelopeGuard: ResponseSchema<VoiceflowEnvelope<T>>,
   ) => Promise<VoiceflowEnvelope<T>>;
   executeEvent: <T>(
     eventReference: XYOpsEventReference,
     params: EventParameters,
-    envelopeGuard: ResponseGuard<VoiceflowEnvelope<T>>,
+    envelopeGuard: ResponseSchema<VoiceflowEnvelope<T>>,
   ) => Promise<VoiceflowEnvelope<T>>;
+  startWorkflow: (
+    workflowReference: XYOpsEventReference,
+    input: XYOpsWorkflowInput,
+    params?: EventParameters,
+  ) => Promise<string>;
+  observeWorkflow: (jobID: string) => Promise<XYOpsJob>;
 }>;

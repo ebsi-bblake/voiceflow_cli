@@ -1,10 +1,10 @@
 import { createXYOpsClient } from "../client";
-import {
-  isCreatedFolderResult,
-  isOptionResult,
-  isVoiceflowEnvelope,
-} from "../guards";
 import { requireEnvelopeResult } from "../validation";
+import { createVoiceflowEnvelopeSchema } from "../schemas/voiceflow-envelope";
+import {
+  CatalogOptionResultSchema,
+  CreatedFolderResultSchema,
+} from "../schemas/catalog-results";
 import { fail } from "../diagnostics";
 import type {
   EventParameters,
@@ -47,7 +47,7 @@ const validateConfiguredOption: ValidateConfiguredOption = async (
   const response = await context.client.readEvent(
     eventReference,
     parameters,
-    isVoiceflowEnvelope(isOptionResult),
+    createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
   );
   const options = readOptions(response, field);
   if (!options.some((option) => option.value === configuredValue))
@@ -136,12 +136,14 @@ const normalizeCatalogName = (value: string): string =>
 
 const pathSegments = (value: string, field: string): readonly string[] => {
   const segments = value.split("/").map((segment) => segment.trim());
-  if (segments.some((segment) =>
-    [...segment].some((character) => {
-      const code = character.charCodeAt(0);
-      return code < 32 || code === 127;
-    }),
-  ))
+  if (
+    segments.some((segment) =>
+      [...segment].some((character) => {
+        const code = character.charCodeAt(0);
+        return code < 32 || code === 127;
+      }),
+    )
+  )
     throw fail("configuration", {
       nextAction: `${field} contains an invalid path segment.`,
     });
@@ -178,9 +180,10 @@ const resolveConfiguredOption: ResolveConfiguredOption = (
   const idMatch = options.find((option) => option.value === configuredValue);
   if (idMatch !== undefined) return idMatch.value;
 
-  const nameMatches = options.filter((option) =>
-    matchesCatalogName(option.label, configuredValue) ||
-    matchesCatalogName(pathName(option.label), configuredValue),
+  const nameMatches = options.filter(
+    (option) =>
+      matchesCatalogName(option.label, configuredValue) ||
+      matchesCatalogName(pathName(option.label), configuredValue),
   );
   if (nameMatches.length === 1) return nameMatches[0].value;
   if (nameMatches.length > 1)
@@ -212,16 +215,13 @@ const selectConfiguredOrCatalog: SelectConfiguredOrCatalog = async (
 ) => {
   if (configuredValue === undefined)
     return selectCatalog(reader, client, eventReference, parameters, title);
-  const response = await client.readEvent(
+  const options = await readConfiguredOptions(
+    client,
     eventReference,
     parameters,
-    isVoiceflowEnvelope(isOptionResult),
-  );
-  return resolveConfiguredOption(
-    configuredValue,
-    readOptions(response, field),
     field,
   );
+  return resolveConfiguredOption(configuredValue, options, field);
 };
 
 type SelectCatalog = (
@@ -241,7 +241,7 @@ const selectCatalog: SelectCatalog = async (
   const response = await client.readEvent(
     eventReference,
     parameters,
-    isVoiceflowEnvelope(isOptionResult),
+    createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
   );
   return chooseOption(reader, title, readOptions(response, title));
 };
@@ -251,12 +251,36 @@ const readOptions = (
   title: string,
 ): readonly { value: string; label: string }[] => {
   try {
-    return requireEnvelopeResult(value, title, isOptionResult).options;
+    return requireEnvelopeResult(
+      value,
+      title,
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
+    ).options;
   } catch {
     throw fail("envelope", {
       nextAction: `${title} returned no usable options.`,
     });
   }
+};
+
+type ReadConfiguredOptions = (
+  client: ReturnType<typeof createXYOpsClient>,
+  eventReference: XYOpsEventReference,
+  parameters: EventParameters,
+  field: string,
+) => Promise<readonly { value: string; label: string }[]>;
+const readConfiguredOptions: ReadConfiguredOptions = async (
+  client,
+  eventReference,
+  parameters,
+  field,
+) => {
+  const response = await client.readEvent(
+    eventReference,
+    parameters,
+    createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
+  );
+  return readOptions(response, field);
 };
 
 type SourceSelection = Pick<
@@ -272,15 +296,15 @@ type SelectDefaultSourceVersion = (
   workspaceID: string,
   projectID: string,
 ) => Promise<string>;
-const selectDefaultSourceVersion: SelectDefaultSourceVersion = async ({
-  reader,
-  client,
-  config,
-}, workspaceID, projectID) => {
+const selectDefaultSourceVersion: SelectDefaultSourceVersion = async (
+  { reader, client, config },
+  workspaceID,
+  projectID,
+) => {
   const response = await client.readEvent(
     config.events.listVersions,
     listVersionsParameters(workspaceID, projectID),
-    isVoiceflowEnvelope(isOptionResult),
+    createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
   );
   const options = readOptions(response, "source_version");
   const draftDevelopment = options.find(
@@ -326,9 +350,10 @@ const configuredSourceValues = (
     const segments = resolvePath(migrationConfig.sourcePath, "source_path", 2);
     return { workspace: segments[0], project: segments.slice(1).join("/") };
   }
-  const project = migrationConfig?.sourceFolderID === undefined
-    ? migrationConfig?.sourceProjectID
-    : `${migrationConfig.sourceFolderID}/${migrationConfig.sourceProjectID}`;
+  const project =
+    migrationConfig?.sourceFolderID === undefined
+      ? migrationConfig?.sourceProjectID
+      : `${migrationConfig.sourceFolderID}/${migrationConfig.sourceProjectID}`;
   return { workspace: migrationConfig?.sourceWorkspaceID, project };
 };
 
@@ -394,10 +419,13 @@ const createDestinationFolder: CreateDestinationFolder = async (
   const response = await client.executeEvent(
     config.events.createFolder,
     createFolderParameters(workspaceID, name),
-    isVoiceflowEnvelope(isCreatedFolderResult),
+    createVoiceflowEnvelopeSchema(CreatedFolderResultSchema),
   );
-  return requireEnvelopeResult(response, "create_folder", isCreatedFolderResult)
-    .folder.value;
+  return requireEnvelopeResult(
+    response,
+    "create_folder",
+    createVoiceflowEnvelopeSchema(CreatedFolderResultSchema),
+  ).folder.value;
 };
 
 type ContinueDestinationFolderSelection = (
@@ -418,46 +446,44 @@ type SelectInteractiveDestinationFolder = (
   context: MigrationContext,
   workspaceID: string,
 ) => Promise<string>;
-const selectInteractiveDestinationFolder: SelectInteractiveDestinationFolder = async (
-  context,
-  workspaceID,
-) => {
-  const { reader, client, config } = context;
-  const response = await client.readEvent(
-    config.events.listFolders,
-    listFoldersParameters(workspaceID),
-    isVoiceflowEnvelope(isOptionResult),
-  );
-  const options = requireEnvelopeResult(
-    response,
-    "destination_folder",
-    isOptionResult,
-  ).options;
-  console.log("\nDestination folder:");
-  options.forEach((option, index) =>
-    console.log(
-      `${index + 1}. ${bounded(option.label)} (${bounded(option.value, 100)})`,
-    ),
-  );
-  const answer = (
-    await reader.ask("Select number or enter a new folder name: ")
-  ).trim();
-  if (answer === "")
-    throw fail("invalid-input", {
-      nextAction: "A destination folder name is required.",
-    });
-  const number = Number.parseInt(answer, 10);
-  if (Number.isInteger(number) && number >= 1 && number <= options.length)
-    return options[number - 1].value;
-  if (isOutOfRangeFolderNumber(answer, number, options.length)) {
-    console.log("\nPlease select one of the displayed folder numbers.");
-    return selectInteractiveDestinationFolder(context, workspaceID);
-  }
-  const exact = resolveFolderInput(answer, options);
-  if (exact !== undefined) return exact;
-  const created = await createDestinationFolder(context, workspaceID, answer);
-  return continueDestinationFolderSelection(created, context, workspaceID);
-};
+const selectInteractiveDestinationFolder: SelectInteractiveDestinationFolder =
+  async (context, workspaceID) => {
+    const { reader, client, config } = context;
+    const response = await client.readEvent(
+      config.events.listFolders,
+      listFoldersParameters(workspaceID),
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
+    );
+    const options = requireEnvelopeResult(
+      response,
+      "destination_folder",
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
+    ).options;
+    console.log("\nDestination folder:");
+    options.forEach((option, index) =>
+      console.log(
+        `${index + 1}. ${bounded(option.label)} (${bounded(option.value, 100)})`,
+      ),
+    );
+    const answer = (
+      await reader.ask("Select number or enter a new folder name: ")
+    ).trim();
+    if (answer === "")
+      throw fail("invalid-input", {
+        nextAction: "A destination folder name is required.",
+      });
+    const number = Number.parseInt(answer, 10);
+    if (Number.isInteger(number) && number >= 1 && number <= options.length)
+      return options[number - 1].value;
+    if (isOutOfRangeFolderNumber(answer, number, options.length)) {
+      console.log("\nPlease select one of the displayed folder numbers.");
+      return selectInteractiveDestinationFolder(context, workspaceID);
+    }
+    const exact = resolveFolderInput(answer, options);
+    if (exact !== undefined) return exact;
+    const created = await createDestinationFolder(context, workspaceID, answer);
+    return continueDestinationFolderSelection(created, context, workspaceID);
+  };
 
 type IsOutOfRangeFolderNumber = (
   answer: string,
@@ -536,7 +562,7 @@ export const selectDestinationSelection: SelectDestinationSelection = async (
           const response = await client.readEvent(
             config.events.listFolders,
             listFoldersParameters(destinationWorkspaceID),
-            isVoiceflowEnvelope(isOptionResult),
+            createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
           );
           const options = readOptions(response, "destination_folder");
           const resolved = resolveFolderInput(configuredFolder, options);

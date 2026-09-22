@@ -1,4 +1,5 @@
-import { isMigrationPlan, isVoiceflowEnvelope } from "../guards";
+import { createVoiceflowEnvelopeSchema } from "../schemas/voiceflow-envelope";
+import { MigrationPlanSchema } from "../schemas/migration-results";
 import { requireEnvelopeResult } from "../validation";
 import type { MigrationPlan, MigrationSelection } from "../types";
 import { planParameters } from "../state";
@@ -8,13 +9,20 @@ type ReadMigrationPlan = (
   context: MigrationContext,
   selection: MigrationSelection,
 ) => Promise<MigrationPlan>;
-export const readMigrationPlan: ReadMigrationPlan = ({ client, config }, selection) =>
+export const readMigrationPlan: ReadMigrationPlan = (
+  { client, config },
+  selection,
+) =>
   client
     .readEvent(
       config.events.planMigration,
       planParameters(selection),
-      isVoiceflowEnvelope(isMigrationPlan),
+      createVoiceflowEnvelopeSchema(MigrationPlanSchema),
     )
     .then((response) =>
-      requireEnvelopeResult(response, "plan_migration", isMigrationPlan),
+      requireEnvelopeResult(
+        response,
+        "plan_migration",
+        createVoiceflowEnvelopeSchema(MigrationPlanSchema),
+      ),
     );

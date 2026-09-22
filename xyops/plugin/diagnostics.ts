@@ -1,70 +1,77 @@
 import { PLUGIN_VERSION } from "./version";
-import { VoiceflowRegex } from "../voiceflow/regex";
+import { OperationFault, toOperationError } from "../voiceflow/contracts";
+import {
+  appendDiagnosticCause,
+  createDiagnostic,
+  createUnexpectedDiagnostic,
+} from "../diagnostics/create";
+
 import { PluginStage } from "./types";
+import type { Diagnostic } from "../diagnostics/types";
 export type { PluginStage } from "./types";
 
 export const pluginStages = Object.values(PluginStage);
 
-const maxDiagnosticLength = 320;
-const maxErrorClassLength = 80;
-
-const readErrorName = (error: unknown): string =>
-  error instanceof Error ? error.name : "UnknownError";
-
-const normalizeErrorName = (name: string): string =>
-  name.trim() === "" ? "UnknownError" : name;
-
-type ReadErrorClass = (error: unknown) => string;
-const readErrorClass: ReadErrorClass = (error) =>
-  normalizeErrorName(readErrorName(error));
-
-const readErrorText = (error: unknown): string =>
-  error instanceof Error ? error.message : "Unknown error";
-
-const normalizeErrorText = (message: string): string =>
-  message.trim() === "" ? "Unknown error" : message;
-
-type ReadErrorMessage = (error: unknown) => string;
-const readErrorMessage: ReadErrorMessage = (error) =>
-  normalizeErrorText(readErrorText(error));
-
-type RemoveStackLines = (message: string) => string;
-const removeStackLines: RemoveStackLines = (message) =>
-  message
-    .split(VoiceflowRegex.pluginLineBreak)
-    .filter((line) => !VoiceflowRegex.stackFrame.test(line))
-    .join(" ");
-
-type RedactSensitiveValues = (message: string) => string;
-const redactSensitiveValues: RedactSensitiveValues = (message) =>
-  message
-    .replace(VoiceflowRegex.bearerValue, "Bearer [REDACTED]")
-    .replace(VoiceflowRegex.pluginJWT, "[REDACTED_JWT]")
-    .replace(VoiceflowRegex.sensitiveAssignment, "$1[REDACTED]")
-    .replace(VoiceflowRegex.dataAssignment, "$1[REDACTED_DATA]")
-    .replace(VoiceflowRegex.structuredData, "[REDACTED_DATA]")
-    .replace(VoiceflowRegex.prefixedSecret, "[REDACTED]")
-    .replace(VoiceflowRegex.pluginLongToken, "[REDACTED]");
-
-const isControlCharacter = (character: string): boolean => {
-  const code = character.charCodeAt(0);
-  if (code <= 31) return true;
-  return code === 127;
+type CreatePluginDiagnostic = (
+  stage: PluginStage,
+  error: unknown,
+) => Diagnostic;
+export const createPluginDiagnostic: CreatePluginDiagnostic = (
+  stage,
+  error,
+) => {
+  if (error instanceof OperationFault) {
+    const coreDiagnostic = toOperationError(error).diagnostic;
+    if (coreDiagnostic === undefined)
+      return createUnexpectedDiagnostic(error, "plugin", stage);
+    return appendDiagnosticCause(
+      coreDiagnostic,
+      createDiagnostic(
+        { code: error.code, retryable: error.retryable },
+        "plugin",
+        stage,
+      ).causes[0],
+    );
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string"
+  ) {
+    return createDiagnostic(
+      { code: error.code, retryable: false },
+      "plugin",
+      stage,
+    );
+  }
+  return createUnexpectedDiagnostic(error, "plugin", stage);
 };
 
-type SanitizeDiagnosticText = (value: string, limit: number) => string;
-const sanitizeDiagnosticText: SanitizeDiagnosticText = (value, limit) =>
-  redactSensitiveValues(removeStackLines(value))
-    .split("")
-    .map((character) => (isControlCharacter(character) ? " " : character))
-    .join("")
-    .replace(VoiceflowRegex.whitespace, " ")
-    .trim()
-    .slice(0, limit);
+const maxDiagnosticLength = 320;
+const maxErrorClassLength = 80;
+const compatibilityMessage = "Structured diagnostic available.";
 
-const fallbackDiagnosticValue = (value: string, fallback: string): string => {
-  if (value === "") return fallback;
-  return value;
+type ReadErrorClass = (error: unknown) => string;
+const readErrorClass: ReadErrorClass = (error) => {
+  const name = error instanceof Error ? error.name : "UnknownError";
+  return (
+    name
+      .split("")
+      .map((character) => {
+        const code = character.charCodeAt(0);
+        return code <= 31 || code === 127 ? " " : character;
+      })
+      .join("")
+      .trim()
+      .slice(0, maxErrorClassLength) || "UnknownError"
+  );
+};
+
+const readCompatibilityMessage = (error: unknown): string => {
+  if (error instanceof Error && error.name === "PluginValidationFault")
+    return error.message;
+  return compatibilityMessage;
 };
 
 type FormatPluginDiagnostic = (stage: PluginStage, error: unknown) => string;
@@ -72,17 +79,12 @@ export const formatPluginDiagnostic: FormatPluginDiagnostic = (
   stage,
   error,
 ) => {
-  const errorClass = sanitizeDiagnosticText(
-    readErrorClass(error),
-    maxErrorClassLength,
-  );
-
-  const message = sanitizeDiagnosticText(
-    readErrorMessage(error),
-    maxDiagnosticLength,
-  );
-
-  return `pluginVersion=${PLUGIN_VERSION} stage=${stage} error=${fallbackDiagnosticValue(errorClass, "UnknownError")} message=${fallbackDiagnosticValue(message, "Unknown error")}`.slice(
+  const diagnostic = createPluginDiagnostic(stage, error);
+  const errorClass = readErrorClass(error);
+  const message = readCompatibilityMessage(error);
+  if (error instanceof Error && error.name === "PluginValidationFault")
+    return `pluginVersion=${PLUGIN_VERSION} stage=${stage} error=${errorClass} message=${message}`;
+  return `pluginVersion=${PLUGIN_VERSION} stage=${stage} error=${errorClass} message=${message} code=${diagnostic.code} domain=${diagnostic.domain} retryable=${diagnostic.retryable} causes=${diagnostic.causes.length}`.slice(
     0,
     maxDiagnosticLength,
   );

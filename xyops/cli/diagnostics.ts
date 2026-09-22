@@ -1,6 +1,42 @@
 import { VoiceflowRegex } from "../voiceflow/regex";
 import type { CliDiagnostic, CliDiagnosticCode } from "./types";
+import type { Diagnostic, SafeContext } from "../diagnostics/types";
+import { redactDiagnosticValue } from "../diagnostics/redact";
+import { DiagnosticSchema, type DiagnosticDTO } from "./schemas/diagnostics";
 export type { CliDiagnostic, CliDiagnosticCode } from "./types";
+
+const isSafeContext = (value: unknown): value is SafeContext =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+const safeContext = (value: Readonly<Record<string, unknown>>): SafeContext => {
+  const redacted = redactDiagnosticValue(value);
+  return isSafeContext(redacted) ? redacted : {};
+};
+const toDiagnostic = (value: DiagnosticDTO): Diagnostic => ({
+  code: value.code,
+  domain: value.domain,
+  stage: value.stage,
+  retryable: value.retryable,
+  nextAction: value.nextAction,
+  context: safeContext(value.context),
+  causes: value.causes.map((cause) => ({
+    domain: cause.domain,
+    code: cause.code,
+    stage: cause.stage,
+    retryable: cause.retryable,
+    context: safeContext(cause.context),
+    ...(cause.diagnostic === undefined
+      ? {}
+      : { diagnostic: toDiagnostic(cause.diagnostic) }),
+  })),
+  ...(value.diagnostic === undefined
+    ? {}
+    : { diagnostic: toDiagnostic(value.diagnostic) }),
+});
+
+export const parseDiagnostic = (value: unknown): Diagnostic | undefined => {
+  const parsed = DiagnosticSchema.safeParse(value);
+  return parsed.success ? toDiagnostic(parsed.data) : undefined;
+};
 
 type SafeEndpoint = (endpoint: string) => string;
 const safeEndpoint: SafeEndpoint = (endpoint) =>
@@ -27,6 +63,7 @@ type DiagnosticOptions = Readonly<{
   retryable?: boolean;
   status?: number;
   nextAction?: string;
+  diagnostic?: Diagnostic;
 }>;
 
 type Fail = (code: CliDiagnosticCode, options?: DiagnosticOptions) => CliError;
@@ -45,6 +82,9 @@ export const fail: Fail = (code, options = {}) =>
     retryable: resolveRetryable(options),
     status: options.status,
     nextAction: resolveNextAction(options),
+    ...(options.diagnostic === undefined
+      ? {}
+      : { diagnostic: options.diagnostic }),
   });
 
 type AsCliError = (error: unknown) => CliError;
@@ -52,13 +92,24 @@ export const asCliError: AsCliError = (error) =>
   error instanceof CliError ? error : fail("network", { retryable: false });
 
 type CliErrorOutput = (error: unknown) => Readonly<Record<string, unknown>>;
+const safeDiagnostic = (diagnostic: Diagnostic): SafeContext => {
+  const redacted = redactDiagnosticValue(diagnostic);
+  return isSafeContext(redacted) ? redacted : {};
+};
 export const cliErrorOutput: CliErrorOutput = (error) => {
   const diagnostic = asCliError(error).diagnostic;
+  const safeNestedDiagnostic =
+    diagnostic.diagnostic === undefined
+      ? undefined
+      : safeDiagnostic(diagnostic.diagnostic);
   return {
     code: diagnostic.code,
     endpoint: diagnostic.endpoint,
     retryable: diagnostic.retryable,
     ...(diagnostic.status === undefined ? {} : { status: diagnostic.status }),
     nextAction: diagnostic.nextAction,
+    ...(safeNestedDiagnostic === undefined
+      ? {}
+      : { diagnostic: safeNestedDiagnostic }),
   };
 };

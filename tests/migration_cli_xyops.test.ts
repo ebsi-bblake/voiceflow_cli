@@ -1,13 +1,20 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { createXYOpsClient } from "../xyops/cli/client";
 import { DEFAULT_XYOPS_BASE_URL, readXYOpsConfig } from "../xyops/cli/config";
 import {
-  isCheckSessionResult,
-  isOptionResult,
-  isVoiceflowEnvelope,
   isEventParameterEntry,
 } from "../xyops/cli/guards";
+import { createVoiceflowEnvelopeSchema } from "../xyops/cli/schemas/voiceflow-envelope";
+import { CatalogOptionResultSchema } from "../xyops/cli/schemas/catalog-results";
+import { CheckSessionResultSchema } from "../xyops/cli/schemas/session";
 import { run } from "../xyops/cli/index";
+import { cliErrorOutput } from "../xyops/cli/diagnostics";
+import { runExecutionWorkflow } from "../xyops/cli/migration/execution-workflow";
+import {
+  toExecutionWorkflowInput,
+  toWorkflowInput,
+} from "../xyops/cli/migration/workflow-input";
 import {
   executeParameters,
   listFoldersParameters,
@@ -20,6 +27,7 @@ import {
 const config = {
   baseURL: "https://xyops.example.test",
   apiKey: "api-key-must-not-leak",
+  migrationMode: "events",
   events: {
     checkSession: "event-check",
     listWorkspaces: "event-workspaces",
@@ -42,6 +50,153 @@ const selection = {
   destinationFolderID: "destination-folder",
   targetSchemaVersion: "13.1",
 } as const;
+
+test("builds non-secret workflow input from parsed migration configuration", () => {
+  expect(toWorkflowInput({
+    sourceWorkspaceID: "workspace-1",
+    sourcePath: "Workspace/Project",
+    destinationWorkspaceID: "workspace-2",
+    targetSchemaVersion: "13.1",
+    secrets: [{ key: "TOKEN", value: "secret-value", type: "" }],
+  })).toEqual({
+    schemaVersion: 1,
+    stage: "CONFIGURED",
+    config: {
+      source_workspace: "workspace-1",
+      source_path: "Workspace/Project",
+      destination_workspace: "workspace-2",
+      target_schema_version: "13.1",
+    },
+    catalog: {},
+    selection: {
+      sourceWorkspaceID: "workspace-1",
+      destinationWorkspaceID: "workspace-2",
+      targetSchemaVersion: "13.1",
+    },
+  });
+});
+
+test("builds a confirmed secret-free execution workflow handoff", () => {
+  expect(toExecutionWorkflowInput({
+    planID: "plan-1",
+    selection,
+    labels: {
+      sourceWorkspace: "Source Workspace",
+      sourceProject: "Source Project",
+      sourceVersion: "Source Version",
+      destinationWorkspace: "Destination Workspace",
+      destinationFolder: "Destination Folder",
+    },
+  })).toEqual({
+    schemaVersion: 1,
+    confirmed: true,
+    planID: "plan-1",
+    plan: {
+      planID: "plan-1",
+      selection,
+      labels: {
+        sourceWorkspace: "Source Workspace",
+        sourceProject: "Source Project",
+        sourceVersion: "Source Version",
+        destinationWorkspace: "Destination Workspace",
+        destinationFolder: "Destination Folder",
+      },
+    },
+  });
+});
+
+test("starts and observes the confirmed execution workflow exactly once", async () => {
+  const calls: string[] = [];
+  const job = { id: "execution-job", code: 0, final: true } as const;
+  const client = {
+    startWorkflow: async (workflow: unknown, input: unknown) => {
+      calls.push(JSON.stringify({ action: "start", workflow, input }));
+      return "execution-job";
+    },
+    observeWorkflow: async (jobID: string) => {
+      calls.push(JSON.stringify({ action: "observe", jobID }));
+      return job;
+    },
+  } as never;
+  const result = await runExecutionWorkflow(
+    client,
+    { id: "execution-workflow" },
+    {
+      planID: "plan-1",
+      selection,
+      labels: {
+        sourceWorkspace: "Source Workspace",
+        sourceProject: "Source Project",
+        sourceVersion: "Source Version",
+        destinationWorkspace: "Destination Workspace",
+        destinationFolder: "Destination Folder",
+      },
+    },
+  );
+
+  expect(result).toEqual({ jobID: "execution-job", job });
+  expect(calls).toHaveLength(2);
+  expect(JSON.parse(calls[0] ?? "{}")).toMatchObject({
+    action: "start",
+    workflow: { id: "execution-workflow" },
+    input: { confirmed: true, planID: "plan-1" },
+  });
+  expect(JSON.parse(calls[1] ?? "{}")).toEqual({
+    action: "observe",
+    jobID: "execution-job",
+  });
+});
+
+test("passes configured secret entries only to the execution workflow params", async () => {
+  let receivedParams: unknown;
+  const client = {
+    startWorkflow: async (_workflow: unknown, _input: unknown, params: unknown) => {
+      receivedParams = params;
+      return "execution-job";
+    },
+    observeWorkflow: async () => ({ id: "execution-job", code: 0, final: true }),
+  } as never;
+
+  await runExecutionWorkflow(
+    client,
+    { id: "execution-workflow" },
+    {
+      planID: "plan-1",
+      selection,
+      labels: {
+        sourceWorkspace: "Source Workspace",
+        sourceProject: "Source Project",
+        sourceVersion: "Source Version",
+        destinationWorkspace: "Destination Workspace",
+        destinationFolder: "Destination Folder",
+      },
+    },
+    [{ key: "TOKEN", value: "secret-value", type: "" }],
+  );
+
+  expect(receivedParams).toEqual({
+    SECRET_FILE_CONTENTS: [{ key: "TOKEN", value: "secret-value", type: "" }],
+  });
+});
+
+test("does not redispatch a timed-out event wait request", async () => {
+  let requests = 0;
+  const client = createXYOpsClient(config, {
+    fetcher: async () => {
+      requests += 1;
+      throw new Error("request timed out");
+    },
+  });
+
+  await expect(
+    client.readEvent(
+      "event-projects",
+      { operation: "list_projects" },
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
+    ),
+  ).rejects.toMatchObject({ diagnostic: { code: "network" } });
+  expect(requests).toBe(1);
+});
 
 const nativePluginOutput = (envelope: unknown): string =>
   JSON.stringify({
@@ -90,7 +245,7 @@ describe("XYOps CLI adapter", () => {
     const result = await client.readEvent(
       "event-projects",
       { operation: "list_projects", SOURCE_WORKSPACE_ID: "workspace-1" },
-      isVoiceflowEnvelope(isOptionResult),
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
     );
 
     const request = requiredRequest(requests);
@@ -133,7 +288,7 @@ describe("XYOps CLI adapter", () => {
       client.readEvent(
         "event-projects",
         { operation: "list_projects" },
-        isVoiceflowEnvelope(isOptionResult),
+        createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
       ),
     ).resolves.toEqual(envelope);
   });
@@ -167,7 +322,7 @@ describe("XYOps CLI adapter", () => {
       client.readEvent(
         "event-check_session",
         { operation: "check_session" },
-        isVoiceflowEnvelope(isCheckSessionResult),
+        createVoiceflowEnvelopeSchema(CheckSessionResultSchema),
       ),
     ).resolves.toEqual(envelope);
   });
@@ -176,6 +331,9 @@ describe("XYOps CLI adapter", () => {
     const config = readXYOpsConfig({ XYOPS_API_KEY: "local-api-key" });
 
     expect(config.baseURL).toBe(DEFAULT_XYOPS_BASE_URL);
+    expect(config.migrationMode).toBe("workflow");
+    expect(config.migrationWorkflow).toEqual({ title: "Voiceflow Migration Workflow" });
+    expect(config.executionWorkflow).toEqual({ title: "Voiceflow Migration Execution Workflow" });
     expect(config.events).toEqual({
       checkSession: { title: "voiceflow_check_session" },
       listWorkspaces: { title: "voiceflow_list_workspaces" },
@@ -198,14 +356,91 @@ describe("XYOps CLI adapter", () => {
       XYOPS_BASE_URL: "https://xyops.example.test/",
       XYOPS_EVENT_CHECK_SESSION: "id:event-check",
       XYOPS_EVENT_LIST_PROJECTS: "title:custom-projects",
+      XYOPS_WORKFLOW_MIGRATION: "id:workflow-definition",
+      XYOPS_WORKFLOW_EXECUTION: "id:execution-workflow-definition",
+      XYOPS_MIGRATION_MODE: "workflow",
     });
 
     expect(config.baseURL).toBe("https://xyops.example.test");
+    expect(config.migrationMode).toBe("workflow");
     expect(config.events.checkSession).toEqual({ id: "event-check" });
     expect(config.events.listProjects).toEqual({ title: "custom-projects" });
+    expect(config.migrationWorkflow).toEqual({ id: "workflow-definition" });
+    expect(config.executionWorkflow).toEqual({ id: "execution-workflow-definition" });
   });
 
-  test("uses an explicit ID reference in the XYOps request body", async () => {
+  test("starts a workflow with validated input data and returns its job ID", async () => {
+  const requests: string[] = [];
+  const client = createXYOpsClient(config, {
+    fetcher: async (_input, init) => {
+      requests.push(requestBody(init));
+      return new Response(JSON.stringify({ code: 0, id: "workflow-job" }), {
+        status: 200,
+      });
+    },
+  });
+
+  await expect(
+    client.startWorkflow(
+      { id: "workflow-definition" },
+      { schemaVersion: 1, config: { source_path: "Source/Project" } },
+    ),
+  ).resolves.toBe("workflow-job");
+  expect(JSON.parse(requests[0] ?? "{}")).toEqual({
+    id: "workflow-definition",
+    params: {},
+    input: {
+      data: { schemaVersion: 1, config: { source_path: "Source/Project" } },
+    },
+  });
+});
+
+test("observes a workflow through SSE and returns the terminal job", async () => {
+  const client = createXYOpsClient(config, {
+    streamer: async () => ({
+      kind: "success",
+      jobID: "workflow-job",
+      code: 0,
+      data: { workflowData: { stage: "CONFIGURED" } },
+      requiresJobResponse: false,
+    }),
+  });
+
+  await expect(client.observeWorkflow("workflow-job")).resolves.toMatchObject({
+    id: "workflow-job",
+    final: true,
+    data: { workflowData: { stage: "CONFIGURED" } },
+  });
+});
+
+test("falls back to polling the same workflow job after stream failure", async () => {
+  let polls = 0;
+  const client = createXYOpsClient(
+    { ...config, pollIntervalMs: 1, pollTimeoutMs: 100 },
+    {
+      streamer: async () => {
+        throw new Error("stream disconnected");
+      },
+      fetcher: async () => {
+        polls += 1;
+        const job =
+          polls === 1
+            ? { id: "workflow-job", state: "active", code: 0, completed: null }
+            : { id: "workflow-job", state: "complete", code: 0, completed: 1, final: true };
+        return new Response(JSON.stringify({ code: 0, job }), { status: 200 });
+      },
+      sleeper: async () => undefined,
+    },
+  );
+
+  await expect(client.observeWorkflow("workflow-job")).resolves.toMatchObject({
+    id: "workflow-job",
+    final: true,
+  });
+  expect(polls).toBe(2);
+});
+
+test("uses an explicit ID reference in the XYOps request body", async () => {
     const requests: string[] = [];
     const client = createXYOpsClient(config, {
       fetcher: async (_input, init) => { requests.push(requestBody(init)); return optionEnvelopeResponse(); },
@@ -214,7 +449,7 @@ describe("XYOps CLI adapter", () => {
     await client.readEvent(
       { id: "event-check" },
       { operation: "check_session" },
-      isVoiceflowEnvelope(isOptionResult),
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
     );
 
     expect(firstBodyJSON(requests)).toMatchObject({ id: "event-check" });
@@ -250,9 +485,7 @@ describe("XYOps CLI adapter", () => {
       client.executeEvent(
         "event-execute",
         { operation: "execute_migration", CONFIRMED: true },
-        isVoiceflowEnvelope((value): value is Readonly<Record<string, unknown>> =>
-          typeof value === "object" && value !== null,
-        ),
+        createVoiceflowEnvelopeSchema(z.record(z.string(), z.unknown())),
       ),
     ).resolves.toMatchObject({ ok: true, operation: "execute_migration" });
   });
@@ -283,7 +516,7 @@ describe("XYOps CLI adapter", () => {
     const result = await client.readEvent(
       "event-projects",
       { operation: "list_projects" },
-      isVoiceflowEnvelope(isOptionResult),
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
     );
 
     expect(result.ok).toBe(true);
@@ -304,7 +537,7 @@ describe("XYOps CLI adapter", () => {
     const error = await client.readEvent(
       "event-projects",
       { operation: "list_projects" },
-      isVoiceflowEnvelope(isOptionResult),
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
     ).catch((value: unknown) => value);
 
     expect(error).toMatchObject({
@@ -314,6 +547,39 @@ describe("XYOps CLI adapter", () => {
       },
     });
     expect(String(error)).not.toContain(rawOutput);
+  });
+
+  test("uses structured job data when failed jobs also contain plain-text output", async () => {
+    const envelope = {
+      ok: false,
+      operation: "list_projects",
+      operationID: "operation-timeout",
+      error: {
+        code: "DEPENDENCY_TIMEOUT",
+        message: "The Voiceflow dependency timed out.",
+        retryable: true,
+      },
+    };
+    const client = createXYOpsClient(config, {
+      fetcher: async () => new Response(JSON.stringify({
+        code: 0,
+        job: {
+          id: "job-plugin-timeout",
+          code: 0,
+          completed: true,
+          output: "[pluginVersion=0.0.6] The Voiceflow dependency timed out.",
+          data: { voiceflow: envelope },
+        },
+      }), { status: 200 }),
+    });
+
+    await expect(
+      client.readEvent(
+        "event-projects",
+        { operation: "list_projects" },
+        createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
+      ),
+    ).resolves.toEqual(envelope);
   });
 
   test("reports a plain-text wait job failure before parsing its output", async () => {
@@ -338,11 +604,75 @@ describe("XYOps CLI adapter", () => {
       client.readEvent(
         "event-projects",
         { operation: "list_projects" },
-        isVoiceflowEnvelope(isOptionResult),
+        createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
       ),
     ).rejects.toMatchObject({
       diagnostic: { code: "job", nextAction: failureDescription },
     });
+  });
+
+  test("preserves structured XYOps diagnostics and redacts nested sensitive context", async () => {
+    const diagnostic = {
+      code: "DEPENDENCY_FAILURE",
+      domain: "transport",
+      stage: "job-response",
+      retryable: true,
+      nextAction: "Retry the operation.",
+      context: { endpoint: "/api/app/run_event/v1", token: "secret-token", safe: "visible" },
+      causes: [{
+        domain: "core",
+        code: "BACKEND_REJECTED",
+        stage: "upstream",
+        retryable: true,
+        context: { password: "secret-password", status: 502 },
+      }],
+    };
+    const client = createXYOpsClient(config, {
+      fetcher: async () => new Response(JSON.stringify({
+        code: 0,
+        job: {
+          id: "job-structured",
+          code: "plugin_failure",
+          completed: true,
+          output: "ignored",
+          data: { diagnostic },
+        },
+      }), { status: 200 }),
+    });
+
+    const error = await client.readEvent(
+      "event-projects",
+      { operation: "list_projects" },
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
+    ).catch((value: unknown) => value);
+
+    expect(error).toMatchObject({
+      diagnostic: {
+        code: "job",
+        nextAction: diagnostic.nextAction,
+        diagnostic: {
+          code: diagnostic.code,
+          domain: diagnostic.domain,
+          stage: diagnostic.stage,
+          retryable: true,
+          context: { safe: "visible", token: "[REDACTED]" },
+          causes: [{ context: { status: 502, password: "[REDACTED]" } }],
+        },
+      },
+    });
+    expect(JSON.stringify(cliErrorOutput(error))).not.toContain("secret-");
+
+    const malformedClient = createXYOpsClient(config, {
+      fetcher: async () => new Response(JSON.stringify({
+        code: 0,
+        job: { id: "job-malformed", code: "failed", completed: true, data: { diagnostic: { code: 42 } } },
+      }), { status: 200 }),
+    });
+    await expect(malformedClient.readEvent(
+      "event-projects",
+      { operation: "list_projects" },
+      createVoiceflowEnvelopeSchema(CatalogOptionResultSchema),
+    )).rejects.toMatchObject({ diagnostic: { code: "job", nextAction: "The migration event job failed." } });
   });
 
   test("checks for an active session before requesting workspace choices", async () => {
@@ -351,6 +681,7 @@ describe("XYOps CLI adapter", () => {
       "XYOPS_BASE_URL",
       "XYOPS_EVENT_CHECK_SESSION",
       "XYOPS_EVENT_LIST_WORKSPACES",
+      "XYOPS_MIGRATION_MODE",
     ];
     const previousEnvironment = Object.fromEntries(
       environmentNames.map((name) => [name, process.env[name]]),
@@ -363,6 +694,7 @@ describe("XYOps CLI adapter", () => {
     delete process.env.XYOPS_BASE_URL;
     delete process.env.XYOPS_EVENT_CHECK_SESSION;
     delete process.env.XYOPS_EVENT_LIST_WORKSPACES;
+    process.env.XYOPS_MIGRATION_MODE = "events";
     globalThis.fetch = async (_input, init) => {
       requests.push(requestBody(init));
       return inactiveSessionResponse();
@@ -397,7 +729,7 @@ describe("XYOps CLI adapter", () => {
     const result = await client.executeEvent(
       "event-execute",
       executeParameters(selection, "plan-1"),
-      isVoiceflowEnvelope((value): value is Readonly<Record<string, unknown>> => typeof value === "object" && value !== null),
+      createVoiceflowEnvelopeSchema(z.record(z.string(), z.unknown())),
     );
 
     expect(result).toEqual({
@@ -431,7 +763,7 @@ describe("XYOps CLI adapter", () => {
     await expect(client.executeEvent(
       "event-execute",
       executeParameters(selection, "plan-1"),
-      isVoiceflowEnvelope((value): value is Readonly<Record<string, unknown>> => typeof value === "object" && value !== null),
+      createVoiceflowEnvelopeSchema(z.record(z.string(), z.unknown())),
     )).rejects.toMatchObject({
       diagnostic: { code: "execute-outcome-unknown" },
     });
@@ -479,7 +811,7 @@ describe("XYOps CLI adapter", () => {
       client.executeEvent(
         "event-execute",
         { operation: "execute_migration" },
-        isVoiceflowEnvelope(() => true),
+        createVoiceflowEnvelopeSchema(z.unknown()),
       ),
     ).resolves.toMatchObject({
       ok: true,
@@ -543,7 +875,7 @@ describe("XYOps CLI adapter", () => {
     const result = await client.executeEvent(
       "event-execute",
       executeParameters(selection, "plan-1"),
-      isVoiceflowEnvelope((value): value is Readonly<Record<string, unknown>> => typeof value === "object" && value !== null),
+      createVoiceflowEnvelopeSchema(z.record(z.string(), z.unknown())),
     );
 
     expect(result.ok).toBe(true);
@@ -582,7 +914,7 @@ describe("XYOps CLI adapter", () => {
       client.executeEvent(
         "event-execute",
         executeParameters(selection, "plan-1"),
-        isVoiceflowEnvelope((value): value is Readonly<Record<string, unknown>> => typeof value === "object" && value !== null),
+        createVoiceflowEnvelopeSchema(z.record(z.string(), z.unknown())),
       ),
     ).rejects.toMatchObject({
       diagnostic: { code: "job", nextAction: failureDescription },

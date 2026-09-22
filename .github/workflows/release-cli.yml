@@ -130,6 +130,11 @@ jobs:
           See docs/cli-release-operations.md for rollback guidance.
           EOF
 
+      - name: Publish build provenance attestations
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/voiceflow-cli-*'
+
       - name: Publish release and assets
         env:
           GH_TOKEN: ${{ github.token }}

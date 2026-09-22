@@ -131,7 +131,7 @@ voiceflow-cli
 ```
 
 For non-interactive migration inputs, pass `--config=<path>` using the checked-in
-shape in `migration.json`. See [`docs/migration-config.md`](docs/migration-config.md)
+shape in `migration.json`. See [`docs/migration_config.md`](docs/migration_config.md)
 for the operator walkthrough and secret-file rollout policy. The file uses snake_case resource keys
 (`source_workspace`, `source_project`, `source_version`, `destination_workspace`, and
 `destination_folder`) that accept exact catalog names or canonical IDs. It may contain a
@@ -139,8 +139,9 @@ for the operator walkthrough and secret-file rollout policy. The file uses snake
 fields, blank configured values, blank or duplicate secret names, and extra secret entry fields
 are rejected; secrets are never included in diagnostics. Configured values bypass their prompts,
 so passing a complete config automates
-the migration-selection steps. An omitted `target_schema_version` uses the
-interactive default `13.1`. The former `--secrets` option is rejected.
+the migration-selection steps. An omitted `target_schema_version` is resolved from the
+source export's `version._version` metadata. The CLI uses the XYOps workflow mode by default;
+set `XYOPS_MIGRATION_MODE=events` only for compatibility. The former `--secrets` option is rejected.
 `XYOPS_EVENT_*` variables accept `title:<event-title>` or `id:<event-id>`.
 After confirmation, the CLI performs a real Voiceflow export and import.
 

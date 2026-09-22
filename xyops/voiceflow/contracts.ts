@@ -11,6 +11,10 @@ export type {
   WarningCode,
 } from "./types";
 import { VoiceflowRegex } from "./regex";
+import {
+  createDiagnostic,
+  createUnexpectedDiagnostic,
+} from "../diagnostics/create";
 import type {
   ErrorCode,
   Failure,
@@ -19,6 +23,7 @@ import type {
   Warning,
   VoiceflowOperation,
 } from "./types";
+import type { DiagnosticCause, DiagnosticDomain } from "../diagnostics/types";
 
 const messages: Readonly<Record<ErrorCode, string>> = {
   INVALID_ARGUMENT: "The supplied arguments are invalid.",
@@ -35,17 +40,36 @@ const messages: Readonly<Record<ErrorCode, string>> = {
   INTERNAL_ERROR: "The operation could not be completed.",
 };
 
+export type OperationFaultDetails = Readonly<{
+  readonly domain?: DiagnosticDomain;
+  readonly stage?: string;
+  readonly context?: unknown;
+  readonly causes?: readonly DiagnosticCause[];
+}>;
+
 export class OperationFault extends Error {
   constructor(
     public readonly code: ErrorCode,
     public readonly retryable = false,
     public readonly diagnostic?: string,
+    public readonly details?: OperationFaultDetails,
   ) {
     super(messages[code]);
   }
 }
 
 const maxDiagnosticLength = 240;
+const trustedFaultDetails = new Set([
+  "exported artifact must contain JSON version metadata with _version in the form major.minor",
+]);
+const safeFaultDetail = (value: string): string => {
+  if (/^[a-z0-9][a-z0-9_-]{0,79}$/i.test(value) || trustedFaultDetails.has(value))
+    return value;
+  const staged = value.match(
+    /^stage=[A-Z_]+ ([a-z0-9][a-z0-9_-]{0,79})$/i,
+  );
+  return staged?.[1] ?? "unsafe-failure-detail";
+};
 const errorDetail = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 const safeUnexpectedErrorMessage = (error: unknown): string => {
@@ -72,19 +96,23 @@ const containsSensitiveWord = (value: string): boolean =>
 type ToOperationError = (error: unknown) => OperationError;
 export const toOperationError: ToOperationError = (error) => {
   if (error instanceof OperationFault) {
+    const diagnostic = createDiagnostic(error, "core", "operation");
     return {
       code: error.code,
       message:
         error.diagnostic === undefined
           ? messages[error.code]
-          : `${messages[error.code]} (stage=${error.diagnostic})`,
-      retryable: error.retryable,
+          : `${messages[error.code]} (stage=${safeFaultDetail(error.diagnostic)})`,
+      retryable: diagnostic.retryable,
+      diagnostic,
     };
   }
+  const diagnostic = createUnexpectedDiagnostic(error, "core", "operation");
   return {
     code: "INTERNAL_ERROR",
     message: safeUnexpectedErrorMessage(error),
-    retryable: false,
+    retryable: diagnostic.retryable,
+    diagnostic,
   };
 };
 

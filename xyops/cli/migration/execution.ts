@@ -1,18 +1,19 @@
-import { isExecuteResult, isVoiceflowEnvelope } from "../guards";
+import { ExecuteResultSchema } from "../schemas/migration-results";
+import { createVoiceflowEnvelopeSchema } from "../schemas/voiceflow-envelope";
 import { requireEnvelopeResult } from "../validation";
 import { bounded } from "../prompt";
 import type {
   ExecuteResult,
-  MigrationPlan,
   MigrationSelection,
   SecretEntries,
+  WorkflowMigrationPlan,
   VoiceflowEnvelope,
   VoiceflowWarning,
 } from "../types";
 import { executeParameters } from "../state";
 import type { MigrationContext } from "./selection";
 
-type DisplayPlan = (plan: MigrationPlan) => void;
+type DisplayPlan = (plan: WorkflowMigrationPlan) => void;
 export const displayPlan: DisplayPlan = (plan) => {
   [
     "\nMigration plan:",
@@ -22,6 +23,9 @@ export const displayPlan: DisplayPlan = (plan) => {
     `Source version: ${bounded(plan.labels.sourceVersion)}`,
     `Destination workspace: ${bounded(plan.labels.destinationWorkspace)}`,
     `Destination folder: ${bounded(plan.labels.destinationFolder)}`,
+    ...(plan.destinationFolderCreation === undefined
+      ? []
+      : [`Action: create destination folder '${bounded(plan.destinationFolderCreation.requestedPath)}'`]),
     `Target schema: ${bounded(plan.selection.targetSchemaVersion, 40)}`,
   ].forEach((msg) => console.log(msg));
 };
@@ -39,13 +43,19 @@ const warnAPIKeyRetrieval = (
   response: VoiceflowEnvelope<ExecuteResult>,
 ): void => {
   if (hasAPIKeyRetrievalWarning(response)) {
-    console.error("WARNING: migration completed, but API-key retrieval failed.");
+    console.error(
+      "WARNING: migration completed, but API-key retrieval failed.",
+    );
     process.exitCode = 2;
   }
 };
 
-type RequestMigrationConfirmation = (reader: MigrationContext["reader"]) => Promise<boolean>;
-export const requestMigrationConfirmation: RequestMigrationConfirmation = (reader) =>
+type RequestMigrationConfirmation = (
+  reader: MigrationContext["reader"],
+) => Promise<boolean>;
+export const requestMigrationConfirmation: RequestMigrationConfirmation = (
+  reader,
+) =>
   reader.ask("Perform this real migration? (yes/no): ").then((answer) => {
     const confirmation = answer.trim().toLowerCase();
     if (["y", "yes"].includes(confirmation)) return true;
@@ -68,12 +78,12 @@ export const executeConfirmedMigration: ExecuteConfirmedMigration = async (
   const executeResponse = await client.executeEvent(
     config.events.executeMigration,
     executeParameters(selection, planID, secretFileContents),
-    isVoiceflowEnvelope(isExecuteResult),
+    createVoiceflowEnvelopeSchema(ExecuteResultSchema),
   );
   const execute = requireEnvelopeResult(
     executeResponse,
     "execute_migration",
-    isExecuteResult,
+    createVoiceflowEnvelopeSchema(ExecuteResultSchema),
   );
   warnAPIKeyRetrieval(executeResponse);
   return execute;
@@ -92,5 +102,10 @@ export const confirmAndExecuteMigration: ConfirmAndExecuteMigration = async (
   secretFileContents,
 ) => {
   if (await requestMigrationConfirmation(context.reader))
-    await executeConfirmedMigration(context, selection, planID, secretFileContents);
+    await executeConfirmedMigration(
+      context,
+      selection,
+      planID,
+      secretFileContents,
+    );
 };

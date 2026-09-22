@@ -2,6 +2,7 @@ import type { AuthContext } from "../types";
 import type { ExportArtifact, HttpBytes, ImportedReceipt } from "../types";
 import { resolveTargetSchemaVersion } from "../export";
 import { OperationFault } from "../contracts";
+import { debugLog } from "../debug";
 import { requestBytes } from "../http";
 import { parseSchemaVersion, parseWorkspaceID } from "../validation";
 import { VOICEFLOW_REALTIME_HTTP_ORIGIN, encodePathSegment } from "../urls";
@@ -84,7 +85,7 @@ const requestImportResponse: RequestImportResponse = async (
   form,
 ) => {
   try {
-    return await requestBytes({
+    const response = await requestBytes({
       url: `${VOICEFLOW_REALTIME_HTTP_ORIGIN}/v1alpha1/assistant/import-file/${encodePathSegment(workspace)}`,
       init: {
         method: "POST",
@@ -94,7 +95,17 @@ const requestImportResponse: RequestImportResponse = async (
       maxBytes: 2_097_152,
       timeoutMs: 60_000,
     });
+    debugLog("migration.import", "http-response", {
+      status: response.status,
+      contentType: response.headers.get("content-type"),
+      responseBytes: response.bytes.byteLength,
+      responseDiagnostic: responseDiagnostic(response.bytes),
+    });
+    return response;
   } catch (error) {
+    debugLog("migration.import", "http-request-failure", {
+      errorCode: error instanceof OperationFault ? error.code : "INTERNAL_ERROR",
+    });
     throw importRequestFault(error);
   }
 };
@@ -131,6 +142,24 @@ const ensureSuccessfulStatus = (status: number): void => {
 
 const isSuccessfulStatus = (status: number): boolean =>
   status >= 200 && status < 300;
+
+type ResponseDiagnostic = string | Readonly<Record<string, unknown>>;
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const responseDiagnostic = (bytes: ArrayBuffer): ResponseDiagnostic => {
+  const text = new TextDecoder().decode(bytes).slice(0, 500);
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!isRecord(parsed)) return text;
+    return Object.fromEntries(
+      ["code", "error", "message", "details", "status"].flatMap((key) =>
+        key in parsed ? [[key, parsed[key]]] : [],
+      ),
+    );
+  } catch {
+    return text;
+  }
+};
 const parseImportBody = (bytes: ArrayBuffer): unknown => {
   try {
     return JSON.parse(new TextDecoder().decode(bytes));

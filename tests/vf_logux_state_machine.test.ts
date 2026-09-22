@@ -2,19 +2,28 @@ import { describe, expect, test } from "bun:test";
 import {
   bypassRename,
   createRenameState,
-  createSecretState,
   transitionRenameState,
+} from "../xyops/voiceflow/logux/rename-state-machine";
+import {
+  createSecretState,
   transitionSecretState,
-} from "../xyops/voiceflow/logux/state-machine";
+} from "../xyops/voiceflow/logux/secret-state-machine";
 import {
   createCatalogState,
   transitionCatalogState,
 } from "../xyops/voiceflow/logux/catalog-state-machine";
-import { summarizeSecretFailureFrame } from "../xyops/voiceflow/logux/create-secret";
+import {
+  isSecretCompletion,
+  isSecretFailure,
+  isSubscriptionComplete,
+  parseLoguxFrame,
+  summarizeSecretFailureFrame,
+} from "../xyops/voiceflow/logux/frame-contract";
 import {
   createFolderState,
   transitionFolderState,
 } from "../xyops/voiceflow/logux/folder-state-machine";
+import { normalizeCatalogFrame } from "../xyops/voiceflow/logux/catalog-frames";
 
 const renameContext = {
   workspaceID: "workspace-id",
@@ -33,7 +42,7 @@ describe("Logux state machines", () => {
       origin: "origin",
       actionID: "action",
     });
-    state = transitionFolderState(state, { kind: "socket-open" }).state;
+    state = transitionFolderState(state, { kind: "connection-established" }).state;
     state = transitionFolderState(state, { kind: "connected", subscriptionSyncID: 10 }).state;
     expect(state.kind).toBe("SUBSCRIBING");
     state = transitionFolderState(state, {
@@ -74,7 +83,7 @@ describe("Logux state machines", () => {
     expect(serverCompletionWithoutOrigin.state.kind).toBe("COMPLETED");
   });
 
-  test("classifies folder close and timeout outcomes by lifecycle state", () => {
+  test("classifies folder close and transport-timeout outcomes by lifecycle state", () => {
     const context = {
       workspaceID: "42",
       channel: "workspace/42",
@@ -83,18 +92,18 @@ describe("Logux state machines", () => {
       actionID: "action",
     } as const;
     let state = createFolderState(context);
-    expect(transitionFolderState(state, { kind: "socket-close" }).state.kind).toBe("FAILED");
-    state = transitionFolderState(state, { kind: "socket-open" }).state;
+    expect(transitionFolderState(state, { kind: "connection-interrupted" }).state.kind).toBe("FAILED");
+    state = transitionFolderState(state, { kind: "connection-established" }).state;
     state = transitionFolderState(state, { kind: "connected", subscriptionSyncID: 10 }).state;
     state = transitionFolderState(state, { kind: "subscription-synced", syncID: 10, mutationSyncID: 11 }).state;
     state = transitionFolderState(state, { kind: "mutation-sent", mutationSyncID: 11 }).state;
-    expect(transitionFolderState(state, { kind: "socket-close" }).state.kind).toBe("UNKNOWN_OUTCOME");
-    expect(transitionFolderState(state, { kind: "timeout" }).state.kind).toBe("UNKNOWN_OUTCOME");
+    expect(transitionFolderState(state, { kind: "connection-interrupted" }).state.kind).toBe("UNKNOWN_OUTCOME");
+    expect(transitionFolderState(state, { kind: "transport-timeout" }).state.kind).toBe("UNKNOWN_OUTCOME");
   });
 
   test("collects a scoped catalog snapshot through the matching subscription", () => {
     let state = createCatalogState("operation", "workspace/workspace-id", ["project"]);
-    state = transitionCatalogState(state, { kind: "socket-open" }).state;
+    state = transitionCatalogState(state, { kind: "connection-established" }).state;
     const subscribing = transitionCatalogState(state, {
       kind: "connected",
       subscriptionSyncID: 10,
@@ -121,7 +130,7 @@ describe("Logux state machines", () => {
 
   test("ignores duplicate and out-of-scope catalog actions", () => {
     let state = createCatalogState("operation", "workspace/workspace-id", ["project", "assistant"]);
-    state = transitionCatalogState(state, { kind: "socket-open" }).state;
+    state = transitionCatalogState(state, { kind: "connection-established" }).state;
     state = transitionCatalogState(state, { kind: "connected", subscriptionSyncID: 10 }).state;
     state = transitionCatalogState(state, { kind: "subscription-synced", syncID: 10 }).state;
     const first = {
@@ -146,7 +155,7 @@ describe("Logux state machines", () => {
 
   test("fails catalog collection when the row bound is exceeded", () => {
     let state = createCatalogState("operation", "workspace/workspace-id", ["project"]);
-    state = transitionCatalogState(state, { kind: "socket-open" }).state;
+    state = transitionCatalogState(state, { kind: "connection-established" }).state;
     state = transitionCatalogState(state, { kind: "connected", subscriptionSyncID: 10 }).state;
     state = transitionCatalogState(state, { kind: "subscription-synced", syncID: 10 }).state;
     const result = transitionCatalogState(state, {
@@ -163,7 +172,7 @@ describe("Logux state machines", () => {
 
   test("advances rename only through matching subscription and mutation sync IDs", () => {
     let state = createRenameState(renameContext);
-    state = transitionRenameState(state, { kind: "socket-open" }).state;
+    state = transitionRenameState(state, { kind: "connection-established" }).state;
     state = transitionRenameState(state, {
       kind: "connected",
       subscriptionSyncID: 10,
@@ -195,7 +204,7 @@ describe("Logux state machines", () => {
   test("requires catalog durability after mutation acknowledgement", () => {
     let state = createRenameState(renameContext);
     for (const event of [
-      { kind: "socket-open" as const },
+      { kind: "connection-established" as const },
       { kind: "connected" as const, subscriptionSyncID: 10 },
       { kind: "subscription-synced" as const, syncID: 10 },
       { kind: "mutation-sent" as const, mutationSyncID: 11, actionID: "action-id" },
@@ -224,24 +233,71 @@ describe("Logux state machines", () => {
   test("classifies close before and after mutation dispatch differently", () => {
     const connected = transitionRenameState(
       createRenameState(renameContext),
-      { kind: "socket-close" },
+      { kind: "connection-interrupted" },
     );
     expect(connected.state.kind).toBe("FAILED");
 
     let sent = createRenameState(renameContext);
     for (const event of [
-      { kind: "socket-open" as const },
+      { kind: "connection-established" as const },
       { kind: "connected" as const, subscriptionSyncID: 10 },
       { kind: "subscription-synced" as const, syncID: 10 },
       { kind: "mutation-sent" as const, mutationSyncID: 11, actionID: "action-id" },
     ]) sent = transitionRenameState(sent, event).state;
-    expect(transitionRenameState(sent, { kind: "socket-close" }).state.kind).toBe(
+    expect(transitionRenameState(sent, { kind: "connection-interrupted" }).state.kind).toBe(
       "UNKNOWN_OUTCOME",
     );
   });
 
   test("bypasses rename when no exact collision exists", () => {
     expect(bypassRename(renameContext).kind).toBe("BYPASSED_NO_COLLISION");
+  });
+
+  test("exports the wire-frame contract for BDD adapters", () => {
+    expect(parseLoguxFrame("not-json")).toBeUndefined();
+    expect(parseLoguxFrame("{}")).toBeUndefined();
+    expect(parseLoguxFrame(JSON.stringify(["unknown", 1]))).toBeUndefined();
+    expect(parseLoguxFrame(JSON.stringify(["sync", 1.5, { type: "action" }]))).toBeUndefined();
+    expect(parseLoguxFrame(JSON.stringify(["error", "x".repeat(81)]))).toBeUndefined();
+    expect(isSubscriptionComplete(["synced", 101], 101)).toBe(true);
+    expect(isSubscriptionComplete(["synced", 102], 101)).toBe(false);
+    expect(
+      isSecretFailure([
+        "sync",
+        0,
+        { type: "secret.CREATE_ONE_FAILED", meta: { actionID: "action-1" } },
+      ], "action-1"),
+    ).toBe(true);
+    expect(
+      isSecretCompletion([
+        "sync",
+        0,
+        {
+          type: "secret.CREATE_ONE_DONE",
+          payload: { result: { context: { assistantID: "assistant-id" } } },
+          meta: { actionID: "action-1" },
+        },
+      ], "action-1", "assistant-id"),
+    ).toBe(true);
+  });
+
+  test("does not normalize heartbeat or non-sync frames as catalog actions", () => {
+    expect(normalizeCatalogFrame(["ping", 95], "operation", "channel", 10, 1)).toBeUndefined();
+    expect(normalizeCatalogFrame([
+      "connected",
+      4,
+      "connection",
+      [],
+      {},
+    ], "operation", "channel", 10, 1)).toEqual({
+      kind: "connected",
+      subscriptionSyncID: 1,
+    });
+    expect(normalizeCatalogFrame([
+      "pong",
+      0,
+      { type: "project.CRUD:REPLACE", payload: { values: [{ id: "leak" }] } },
+    ], "operation", "channel", 10, 1)).toBeUndefined();
   });
 
   test("summarizes secret failures without exposing sensitive detail", () => {
@@ -261,29 +317,36 @@ describe("Logux state machines", () => {
     ]);
 
     expect(summary).toEqual({
-      failureCode: "secret.invalid-value",
-      failureMessage: "Bearer [redacted] VF.DM.[redacted] [redacted-url]",
-      failureDetails: "opaque",
+      failureCause: {
+        kind: "dependency-failure",
+        code: "dependency-failed",
+      },
     });
     expect(JSON.stringify(summary)).not.toContain("eyJheader.payload.signature");
     expect(JSON.stringify(summary)).not.toContain("fake-value");
+    expect(JSON.stringify(summary)).not.toContain("secret.invalid-value");
+    expect(JSON.stringify(summary)).not.toContain("private");
 
-    const longMessage = summarizeSecretFailureFrame([
+    const payloadWithSensitiveFields = summarizeSecretFailureFrame([
       "sync",
       20,
       {
         type: "secret.CREATE_ONE_FAILED",
-        payload: { error: { message: `${"head ".repeat(100)}tail-reason` } },
+        payload: {
+          error: {
+            code: "Bearer eyJheader.payload.signature",
+            message: "secret details",
+          },
+        },
       },
     ]);
-    expect(longMessage.failureMessage).toContain("tail-reason");
-    expect(longMessage.failureMessage?.length).toBeLessThanOrEqual(484);
+    expect(payloadWithSensitiveFields).toEqual(summary);
   });
 
   test("requires the matching secret action ID", () => {
     let state = createSecretState("assistant-id", "action-id");
     for (const event of [
-      { kind: "socket-open" as const },
+      { kind: "connection-established" as const },
       { kind: "connected" as const },
       { kind: "subscription-synced" as const },
       { kind: "mutation-sent" as const, mutationSyncID: 20 },
@@ -295,5 +358,36 @@ describe("Logux state machines", () => {
     expect(
       transitionSecretState(state, { kind: "secret-done", actionID: "action-id" }).kind,
     ).toBe("COMPLETED");
+  });
+
+  test("preserves secret completion action and assistant correlation", () => {
+    const completion = [
+      "sync",
+      20,
+      {
+        type: "secret.CREATE_ONE_DONE",
+        payload: { result: { context: { assistantID: "assistant-id" } } },
+        meta: { actionID: "action-id" },
+      },
+    ] as const;
+    expect(isSecretCompletion(completion, "other", "assistant-id")).toBe(false);
+    expect(isSecretCompletion(completion, "action-id", "other")).toBe(false);
+    expect(isSecretCompletion(completion, "action-id", "assistant-id")).toBe(true);
+  });
+
+  test("keeps secret mutation failures unknown after dispatch", () => {
+    let state = createSecretState("assistant-id", "action-id");
+    for (const event of [
+      { kind: "connection-established" as const },
+      { kind: "connected" as const },
+      { kind: "subscription-synced" as const },
+      { kind: "mutation-sent" as const, mutationSyncID: 20 },
+    ]) state = transitionSecretState(state, event);
+    expect(transitionSecretState(state, { kind: "transport-timeout" }).kind).toBe(
+      "UNKNOWN_OUTCOME",
+    );
+    expect(transitionSecretState(state, { kind: "connection-interrupted" }).kind).toBe(
+      "UNKNOWN_OUTCOME",
+    );
   });
 });

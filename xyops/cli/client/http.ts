@@ -1,10 +1,8 @@
-import { fail, CliError } from "../diagnostics";
-import {
-  isRetryableStatus,
-  isSuccessfulCode,
-  isXYOpsResponse,
-} from "../guards";
+import { fail, CliError, parseDiagnostic } from "../diagnostics";
+import { isRetryableStatus, isSuccessfulCode } from "../guards";
+import { XYOpsResponseSchema } from "../schemas/xyops-responses";
 import type { XYOpsResponse } from "../types";
+import { XYOpsRecordSchema } from "../schemas/xyops-responses";
 
 export type Sleep = (milliseconds: number) => Promise<void>;
 export type RequestBody = Readonly<Record<string, unknown>>;
@@ -44,49 +42,77 @@ const fetchRequest: FetchRequest = async (
 ) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  return fetcher(url, {
-    method: "POST",
-    headers: { "content-type": "application/json", "X-API-Key": apiKey },
-    body: JSON.stringify(body),
-    signal: controller.signal,
-  })
-    .catch((error) => Promise.reject(toFetchError(error, endpoint)))
-    .finally(() => clearTimeout(timeout));
+  try {
+    return await fetcher(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-API-Key": apiKey },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    throw toFetchError(error, endpoint);
+  } finally {
+    clearTimeout(timeout);
+  }
 };
 
-type RequireHTTPResponse = (response: Response, endpoint: string) => Response;
-const requireHTTPResponse: RequireHTTPResponse = (response, endpoint) => {
-  if (!response.ok)
-    throw fail("http", {
-      endpoint,
-      status: response.status,
-      retryable: isRetryableStatus(response.status),
-    });
-  return response;
+type ReadHTTPDiagnostic = (
+  response: Response,
+) => Promise<ReturnType<typeof parseDiagnostic>>;
+export const readHTTPDiagnostic: ReadHTTPDiagnostic = async (response) => {
+  try {
+    const body: unknown = await response.clone().json();
+    const record = XYOpsRecordSchema.safeParse(body);
+    if (!record.success) return undefined;
+    const error = XYOpsRecordSchema.safeParse(record.data.error);
+    const candidate =
+      record.data.diagnostic ??
+      (error.success ? error.data.diagnostic : undefined);
+    return parseDiagnostic(candidate);
+  } catch {
+    return undefined;
+  }
+};
+
+type RequireHTTPResponse = (
+  response: Response,
+  endpoint: string,
+) => Promise<Response>;
+const requireHTTPResponse: RequireHTTPResponse = async (response, endpoint) => {
+  if (response.ok) return response;
+  const diagnostic = await readHTTPDiagnostic(response);
+  throw fail("http", {
+    endpoint,
+    status: response.status,
+    retryable: isRetryableStatus(response.status),
+    ...(diagnostic === undefined ? {} : { diagnostic }),
+  });
 };
 
 type ParseJSONResponse = (
   response: Response,
   endpoint: string,
 ) => Promise<unknown>;
-const parseJSONResponse: ParseJSONResponse = (response, endpoint) =>
-  response.json().catch(() =>
-    Promise.reject(
-      fail("api", {
-        endpoint,
-        nextAction: "XYOps returned an invalid JSON response.",
-      }),
-    ),
-  );
+const parseJSONResponse: ParseJSONResponse = async (response, endpoint) => {
+  try {
+    return await response.json();
+  } catch {
+    throw fail("api", {
+      endpoint,
+      nextAction: "XYOps returned an invalid JSON response.",
+    });
+  }
+};
 
 type RequireXYOpsResponse = (value: unknown, endpoint: string) => XYOpsResponse;
 const requireXYOpsResponse: RequireXYOpsResponse = (value, endpoint) => {
-  if (!isXYOpsResponse(value))
+  const parsed = XYOpsResponseSchema.safeParse(value);
+  if (!parsed.success)
     throw fail("api", {
       endpoint,
       nextAction: "XYOps returned an invalid response.",
     });
-  return value;
+  return parsed.data;
 };
 
 type RequireSuccessfulResponse = (
@@ -125,14 +151,12 @@ export const fetchJSON: FetchJSON = async (
   timeoutMs,
   endpoint,
 ) => {
-  const response = requireHTTPResponse(
+  const response = await requireHTTPResponse(
     await fetchRequest(fetcher, url, apiKey, body, timeoutMs, endpoint),
     endpoint,
   );
-  return validateAPIResponse(
-    await parseJSONResponse(response, endpoint),
-    endpoint,
-  );
+  const parsed = await parseJSONResponse(response, endpoint);
+  return validateAPIResponse(parsed, endpoint);
 };
 
 type FetchSSE = <T>(
@@ -153,27 +177,28 @@ export const fetchSSE: FetchSSE = async (
 ) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  return fetcher(url, {
-    method: "GET",
-    headers: { Accept: "text/event-stream", "X-API-Key": apiKey },
-    signal: controller.signal,
-  })
-    .catch((error) => Promise.reject(toFetchError(error, endpoint)))
-    .then((response) => {
-      if (!response.ok)
-        throw fail("http", {
-          endpoint,
-          status: response.status,
-          retryable: isRetryableStatus(response.status),
-        });
-      return readResponse(response);
-    })
-    .catch((error) =>
-      error instanceof CliError
-        ? Promise.reject(error)
-        : Promise.reject(toFetchError(error, endpoint)),
-    )
-    .finally(() => clearTimeout(timeout));
+  try {
+    const response = await fetcher(url, {
+      method: "GET",
+      headers: { Accept: "text/event-stream", "X-API-Key": apiKey },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const diagnostic = await readHTTPDiagnostic(response);
+      throw fail("http", {
+        endpoint,
+        status: response.status,
+        retryable: isRetryableStatus(response.status),
+        ...(diagnostic === undefined ? {} : { diagnostic }),
+      });
+    }
+    return await readResponse(response);
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw toFetchError(error, endpoint);
+  } finally {
+    clearTimeout(timeout);
+  }
 };
 
 export const defaultSleep: Sleep = (milliseconds) =>

@@ -1,6 +1,7 @@
 import { OperationFault } from "./contracts";
 import { VoiceflowRegex } from "./regex";
-import { isClaims, isValidCreatorID } from "./guards";
+import { isValidCreatorID } from "./guards";
+import { VoiceflowAuthClaimsSchema } from "./schemas/auth_claims";
 import type { AuthContext } from "./types";
 
 type Claims = Readonly<Record<string, unknown>>;
@@ -25,26 +26,26 @@ const validateJWT = (token: string): void => {
 
 type DecodeClaims = (token: string) => Claims;
 const decodeClaims: DecodeClaims = (token) => {
+  const part = token.split(".")[1];
+  const normalizedPart = part
+    .replace(VoiceflowRegex.base64UrlDash, "+")
+    .replace(VoiceflowRegex.base64UrlUnderscore, "/");
+  const padded = normalizedPart.padEnd(
+    Math.ceil(normalizedPart.length / 4) * 4,
+    "=",
+  );
+  let value: unknown;
   try {
-    const part = token.split(".")[1];
-    const normalizedPart = part
-      .replace(VoiceflowRegex.base64UrlDash, "+")
-      .replace(VoiceflowRegex.base64UrlUnderscore, "/");
-    const padded = normalizedPart.padEnd(
-      Math.ceil(normalizedPart.length / 4) * 4,
-      "=",
-    );
-    const value: unknown = JSON.parse(
-      Buffer.from(padded, "base64").toString("utf8"),
-    );
-    return requireClaims(value);
+    value = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
   } catch {
     throw new OperationFault("AUTHENTICATION_FAILED");
   }
+  return requireClaims(value);
 };
 const requireClaims = (value: unknown): Claims => {
-  if (!isClaims(value)) throw new Error();
-  return value;
+  const parsed = VoiceflowAuthClaimsSchema.safeParse(value);
+  if (!parsed.success) throw new OperationFault("AUTHENTICATION_FAILED");
+  return parsed.data;
 };
 
 type ExtractCreatorID = (claims: Claims) => string;

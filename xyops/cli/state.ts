@@ -5,6 +5,13 @@ import type {
   Option,
   SecretEntries,
 } from "./types";
+import {
+  buildExecuteMigrationParameters,
+  buildPlanMigrationParameters,
+  MigrationParameterName,
+} from "../migration-parameters";
+import { VoiceflowOperation } from "../voiceflow/types";
+import type { VoiceflowOperation as VoiceflowOperationType } from "../voiceflow/types";
 import { isEventParameterEntry } from "./guards";
 import { fail } from "./diagnostics";
 import type { MigrationState } from "./types";
@@ -70,37 +77,47 @@ export const chooseOptionValue: ChooseOptionValue = (options, index) =>
 
 type DebugParameter = () => string | true | undefined;
 const debugParameter: DebugParameter = () => {
-  const argument = process.argv.find((value) => value === "--debug" || value.startsWith("--debug="));
+  const argument = process.argv.find(
+    (value) => value === "--debug" || value.startsWith("--debug="),
+  );
   if (argument === "--debug") return true;
-  if (argument?.startsWith("--debug=")) return argument.slice("--debug=".length);
+  if (argument?.startsWith("--debug="))
+    return argument.slice("--debug=".length);
   return undefined;
 };
 
+type MigrationParameterValues = Readonly<
+  Partial<Record<MigrationParameterName, EventParameterValue | undefined>>
+>;
+
 type EventParametersFor = (
-  operation: string,
-  values?: Readonly<Record<string, EventParameterValue | undefined>>,
+  operation: VoiceflowOperationType,
+  values?: MigrationParameterValues,
 ) => EventParameters;
 export const eventParametersFor: EventParametersFor = (
   operation,
   values = {},
 ) =>
   Object.fromEntries(
-    Object.entries({ operation, ...values, DEBUG: debugParameter() } as Record<
-      string,
-      EventParameterValue | undefined
-    >).filter(isEventParameterEntry),
+    Object.entries({
+      [MigrationParameterName.operation]: operation,
+      ...values,
+      [MigrationParameterName.debug]: debugParameter(),
+    } as Record<string, EventParameterValue | undefined>).filter(
+      isEventParameterEntry,
+    ),
   );
 
 type ListWorkspacesParameters = () => EventParameters;
 export const listWorkspacesParameters: ListWorkspacesParameters = () =>
-  eventParametersFor("list_workspaces");
+  eventParametersFor(VoiceflowOperation.ListWorkspaces);
 
 type ListProjectsParameters = (sourceWorkspaceID: string) => EventParameters;
 export const listProjectsParameters: ListProjectsParameters = (
   sourceWorkspaceID,
 ) =>
-  eventParametersFor("list_projects", {
-    SOURCE_WORKSPACE_ID: sourceWorkspaceID,
+  eventParametersFor(VoiceflowOperation.ListProjects, {
+    [MigrationParameterName.sourceWorkspaceID]: sourceWorkspaceID,
   });
 
 type ListVersionsParameters = (
@@ -111,9 +128,9 @@ export const listVersionsParameters: ListVersionsParameters = (
   sourceWorkspaceID,
   sourceProjectID,
 ) =>
-  eventParametersFor("list_versions", {
-    SOURCE_WORKSPACE_ID: sourceWorkspaceID,
-    SOURCE_PROJECT_ID: sourceProjectID,
+  eventParametersFor(VoiceflowOperation.ListVersions, {
+    [MigrationParameterName.sourceWorkspaceID]: sourceWorkspaceID,
+    [MigrationParameterName.sourceProjectID]: sourceProjectID,
   });
 
 type CreateFolderParameters = (
@@ -124,9 +141,9 @@ export const createFolderParameters: CreateFolderParameters = (
   destinationWorkspaceID,
   folderName,
 ) =>
-  eventParametersFor("create_folder", {
-    DESTINATION_WORKSPACE_ID: destinationWorkspaceID,
-    DESTINATION_FOLDER_ID: folderName,
+  eventParametersFor(VoiceflowOperation.CreateFolder, {
+    [MigrationParameterName.destinationWorkspaceID]: destinationWorkspaceID,
+    [MigrationParameterName.destinationFolderID]: folderName,
   });
 
 type ListFoldersParameters = (
@@ -135,20 +152,13 @@ type ListFoldersParameters = (
 export const listFoldersParameters: ListFoldersParameters = (
   destinationWorkspaceID,
 ) =>
-  eventParametersFor("list_folders", {
-    DESTINATION_WORKSPACE_ID: destinationWorkspaceID,
+  eventParametersFor(VoiceflowOperation.ListFolders, {
+    [MigrationParameterName.destinationWorkspaceID]: destinationWorkspaceID,
   });
 
 type PlanParameters = (selection: MigrationSelection) => EventParameters;
 export const planParameters: PlanParameters = (selection) =>
-  eventParametersFor("plan_migration", {
-    SOURCE_WORKSPACE_ID: selection.sourceWorkspaceID,
-    SOURCE_PROJECT_ID: selection.sourceProjectID,
-    SOURCE_VERSION_ID: selection.sourceVersionID,
-    DESTINATION_WORKSPACE_ID: selection.destinationWorkspaceID,
-    DESTINATION_FOLDER_ID: selection.destinationFolderID,
-    TARGET_SCHEMA_VERSION: selection.targetSchemaVersion,
-  });
+  buildPlanMigrationParameters(selection);
 
 type ExecuteParameters = (
   selection: MigrationSelection,
@@ -159,15 +169,4 @@ export const executeParameters: ExecuteParameters = (
   selection,
   planID,
   secretFileContents,
-) =>
-  eventParametersFor("execute_migration", {
-    PLAN_ID: planID,
-    SOURCE_WORKSPACE_ID: selection.sourceWorkspaceID,
-    SOURCE_PROJECT_ID: selection.sourceProjectID,
-    SOURCE_VERSION_ID: selection.sourceVersionID,
-    DESTINATION_WORKSPACE_ID: selection.destinationWorkspaceID,
-    DESTINATION_FOLDER_ID: selection.destinationFolderID,
-    TARGET_SCHEMA_VERSION: selection.targetSchemaVersion,
-    CONFIRMED: true,
-    SECRET_FILE_CONTENTS: secretFileContents,
-  });
+) => buildExecuteMigrationParameters(selection, planID, secretFileContents);

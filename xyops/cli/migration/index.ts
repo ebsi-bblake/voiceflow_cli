@@ -6,10 +6,12 @@ import {
   readXYOpsConfig,
 } from "../config";
 import { createXYOpsClient } from "../client";
+import { completeJob } from "../client/polling";
 import { CheckSessionResultSchema } from "../schemas/session";
+import { ExecuteResultSchema } from "../schemas/migration-results";
 import { createVoiceflowEnvelopeSchema } from "../schemas/voiceflow-envelope";
 import { requireEnvelopeResult } from "../validation";
-import { asCliError, cliErrorOutput, fail } from "../diagnostics";
+import { asCliError, fail, formatCliError } from "../diagnostics";
 import {
   eventParametersFor,
   initialMigrationState,
@@ -33,6 +35,7 @@ import { progress } from "../progress";
 import { VoiceflowOperation } from "../../voiceflow/types";
 import { MigrationWorkflowDataSchema } from "../../migration-workflow-data";
 import { toWorkflowInput } from "./workflow-input";
+import type { WorkflowMigrationPlan } from "../types";
 import { runExecutionWorkflow } from "./execution-workflow";
 
 type PrintHelp = () => void;
@@ -86,6 +89,10 @@ const readWorkflowDataCandidate: ReadWorkflowDataCandidate = (job) => {
   return workflowData;
 };
 
+type FormatMigrationSuccess = (plan: WorkflowMigrationPlan) => string;
+const formatMigrationSuccess: FormatMigrationSuccess = (plan) =>
+  `Migration completed successfully: ${plan.labels.sourceProject} / ${plan.labels.sourceVersion} was imported into ${plan.labels.destinationWorkspace} / ${plan.labels.destinationFolder} (schema ${plan.selection.targetSchemaVersion}).`;
+
 type PerformWorkflowMigration = (context: MigrationContext) => Promise<void>;
 // eslint-disable-next-line complexity
 const performWorkflowMigration: PerformWorkflowMigration = async ({ client, config, migrationConfig, reader }) => {
@@ -129,9 +136,14 @@ const performWorkflowMigration: PerformWorkflowMigration = async ({ client, conf
       ),
     );
     const executionJob = execution.job;
-    if (executionJob.code !== undefined && executionJob.code !== 0 && executionJob.code !== "0")
+    if (executionJob.code !== undefined && executionJob.code !== 0 && executionJob.code !== "0") {
+      completeJob(
+        executionJob,
+        createVoiceflowEnvelopeSchema(ExecuteResultSchema),
+      );
       throw fail("job", { nextAction: "The execution workflow failed." });
-    console.log("Migration completed successfully.");
+    }
+    console.log(formatMigrationSuccess(planned.plan));
     return;
   }
   console.log("Migration planning completed.");
@@ -190,7 +202,7 @@ const performMigration: PerformMigration = async (context) => {
       secretFileContents,
     ),
   );
-  console.log("Migration completed successfully.");
+  console.log(formatMigrationSuccess(plan));
 };
 
 type Run = () => Promise<void>;
@@ -228,10 +240,7 @@ export const run: Run = async () => {
 type HandleFailure = (error: unknown) => void;
 const handleFailure: HandleFailure = (error) => {
   process.exitCode = 1;
-  const diagnostic = cliErrorOutput(asCliError(error));
-  console.error(
-    `Migration failed: ${String(diagnostic.code)}. ${String(diagnostic.nextAction)}`,
-  );
+  console.error(formatCliError(asCliError(error)));
 };
 
 if (import.meta.main) {

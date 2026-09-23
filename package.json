@@ -1,7 +1,7 @@
 {
   "name": "voiceflow-automation",
-  "version": "0.0.6",
-  "pluginVersion": "0.0.18",
+  "version": "0.0.7",
+  "pluginVersion": "0.0.19",
   "devDependencies": {
     "@cucumber/cucumber": "^13.2.1",
     "@types/node": "^22.0.0",

@@ -18,13 +18,28 @@ const readWorkflowData = (value: unknown): unknown => {
 const normalize = (value: string): string => value.normalize("NFC").trim().toLowerCase();
 const configuredWorkspace = (config: { destination_workspace?: string; destination_path?: string }): string | undefined =>
   config.destination_workspace ?? config.destination_path?.split("/")[0]?.trim();
-const resolveWorkspace = (config: { destination_workspace?: string; destination_path?: string }, workspaces: readonly { id: string; label: string }[]): string => {
+export const resolveWorkspace = (config: { destination_workspace?: string; destination_path?: string }, workspaces: readonly { id: string; label: string }[]): string => {
   const value = configuredWorkspace(config);
   if (value === undefined || value === "") throw new OperationFault("CONFIGURATION");
   const exact = workspaces.find((workspace) => workspace.id === value);
   if (exact !== undefined) return exact.id;
   const matches = workspaces.filter((workspace) => normalize(workspace.label) === normalize(value));
-  if (matches.length !== 1) throw new OperationFault("CONFIGURATION");
+  if (matches.length !== 1) {
+    throw new OperationFault(
+      "CONFIGURATION",
+      false,
+      "destination-workspace-resolution-mismatch",
+      {
+        stage: "destination-resolution",
+        context: {
+          configuredSelection: config,
+          configuredWorkspace: normalize(value),
+          candidateCount: workspaces.length,
+          candidateLabels: workspaces.map((workspace) => workspace.label).slice(0, 20),
+        },
+      },
+    );
+  }
   return matches[0].id;
 };
 export const main: Main = async (token, input) => {

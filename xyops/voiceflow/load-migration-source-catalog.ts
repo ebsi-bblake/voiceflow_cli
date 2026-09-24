@@ -35,7 +35,7 @@ const readConfiguredData = (value: unknown) => {
   return parsed.data;
 };
 
-const resolveWorkspace = (
+export const resolveWorkspace = (
   config: { source_workspace?: string; source_path?: string },
   workspaces: readonly { id: string; label: string }[],
 ): string => {
@@ -46,7 +46,22 @@ const resolveWorkspace = (
   const matches = workspaces.filter(
     (workspace) => normalizeName(workspace.label) === normalizeName(value),
   );
-  if (matches.length !== 1) throw new OperationFault("CONFIGURATION");
+  if (matches.length !== 1) {
+    throw new OperationFault(
+      "CONFIGURATION",
+      false,
+      "source-workspace-resolution-mismatch",
+      {
+        stage: "source-resolution",
+        context: {
+          configuredSelection: config,
+          configuredWorkspace: normalizeName(value),
+          candidateCount: workspaces.length,
+          candidateLabels: workspaces.map((workspace) => workspace.label).slice(0, 20),
+        },
+      },
+    );
+  }
   return matches[0].id;
 };
 
